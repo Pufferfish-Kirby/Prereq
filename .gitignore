@@ -217,4 +217,5 @@ frontend/dist/
 .env.local
 .env.*.local
 
-CLAUDE.md
+TOOLS_AND_SETUP.md
+AI_MODEL_GUIDE.md
