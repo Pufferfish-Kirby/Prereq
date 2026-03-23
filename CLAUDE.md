@@ -288,6 +288,7 @@ The AI advisor should receive:
 - **Don't trust AI output blindly.** Always validate generated plans against prerequisite data programmatically.
 - **Don't scrape UofT in production.** Scrape once, store as JSON/DB, update periodically. Don't hit their servers on every request.
 - **Don't forget about breadth requirements.** UofT Arts & Science has specific breadth/distribution requirements that must be satisfied — the planner must account for these.
+- **When generating code, add detailed comments explaining WHY each piece exists, not just what it does. Explain design decisions inline.** I still want to be learning a lot from this project so this is important.
 
 ---
 

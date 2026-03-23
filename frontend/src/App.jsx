@@ -1,120 +1,191 @@
 import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
 import './App.css'
 
+// Workload options map course-load intensity to a human-readable label.
+// These will eventually feed into the AI planner's constraint system.
+const WORKLOAD_OPTIONS = [
+  { value: '', label: 'Select a workload...' },
+  { value: 'light', label: 'Light (3–4 courses/semester)' },
+  { value: 'standard', label: 'Standard (5 courses/semester)' },
+  { value: 'heavy', label: 'Heavy (6 courses/semester)' },
+]
+
 function App() {
-  const [count, setCount] = useState(0)
+  // Form field state — kept flat because this form is simple enough
+  // that a single object would just add boilerplate.
+  const [interests, setInterests] = useState('')
+  const [workload, setWorkload] = useState('')
+
+  // Submitted snapshot — null until the user hits "Generate Plan".
+  // Separating "live form state" from "submitted state" prevents the
+  // output panel from updating on every keystroke.
+  const [submitted, setSubmitted] = useState(null)
+
+  function handleSubmit(e) {
+    // Prevent the default browser form navigation
+    e.preventDefault()
+
+    // Parse interests into a clean array — trim whitespace and drop empties
+    // so "  math,  cs,  " becomes ["math", "cs"] instead of a messy list.
+    const parsedInterests = interests
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+
+    setSubmitted({ interests: parsedInterests, workload })
+  }
 
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.jsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
+    // Full-height dark-blue background — this is UofT's primary brand colour (#002A5C)
+    <div className="min-h-screen bg-uoft-blue flex flex-col">
 
-      <div className="ticks"></div>
+      {/* ── Navbar ── */}
+      <header className="bg-uoft-blue border-b border-white/20 px-8 py-4 flex items-center gap-3">
+        {/* The thick left border acts as a quick visual accent without needing an image */}
+        <div className="w-1 h-8 bg-white rounded-full" />
+        <h1 className="text-white text-xl font-semibold tracking-wide">MyUofT</h1>
+        <span className="text-white/50 text-sm ml-1">/ Course Planner</span>
+      </header>
 
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
+      {/* ── Main content ── */}
+      <main className="flex-1 flex items-center justify-center px-4 py-12">
+        <div className="w-full max-w-lg space-y-8">
 
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
+          {/* Page heading */}
+          <div className="text-center">
+            <h2 className="text-white text-3xl font-bold tracking-tight">
+              Plan Your Degree
+            </h2>
+            <p className="text-white/60 mt-2 text-sm">
+              Tell us your interests and how hard you want to work — we'll handle the rest.
+            </p>
+          </div>
+
+          {/* ── Input form ── */}
+          {/* White card sits on the dark blue background for contrast */}
+          <form
+            onSubmit={handleSubmit}
+            className="bg-white rounded-2xl shadow-xl p-8 space-y-6"
+          >
+
+            {/* Interests field */}
+            <div className="space-y-2">
+              <label
+                htmlFor="interests"
+                className="block text-sm font-semibold text-uoft-blue"
+              >
+                Interests
+              </label>
+              <input
+                id="interests"
+                type="text"
+                value={interests}
+                onChange={(e) => setInterests(e.target.value)}
+                placeholder="e.g. machine learning, philosophy, economics"
+                // Required so the browser blocks submission if left empty
+                required
+                className="
+                  w-full rounded-lg border border-gray-200 px-4 py-3
+                  text-sm text-gray-800 placeholder-gray-400
+                  focus:outline-none focus:ring-2 focus:ring-uoft-blue/40 focus:border-uoft-blue
+                  transition
+                "
+              />
+              <p className="text-xs text-gray-400">
+                Separate multiple interests with commas
+              </p>
+            </div>
+
+            {/* Workload dropdown */}
+            <div className="space-y-2">
+              <label
+                htmlFor="workload"
+                className="block text-sm font-semibold text-uoft-blue"
+              >
+                Workload preference
+              </label>
+              <select
+                id="workload"
+                value={workload}
+                onChange={(e) => setWorkload(e.target.value)}
+                required
+                className="
+                  w-full rounded-lg border border-gray-200 px-4 py-3
+                  text-sm text-gray-800
+                  focus:outline-none focus:ring-2 focus:ring-uoft-blue/40 focus:border-uoft-blue
+                  transition appearance-none bg-white
+                "
+              >
+                {WORKLOAD_OPTIONS.map(({ value, label }) => (
+                  <option key={value} value={value} disabled={value === ''}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Submit */}
+            <button
+              type="submit"
+              className="
+                w-full bg-uoft-blue text-white font-semibold rounded-lg
+                py-3 text-sm tracking-wide
+                hover:bg-uoft-blue/90 active:scale-[0.98]
+                transition-all duration-150
+                focus:outline-none focus:ring-2 focus:ring-uoft-blue/40
+              "
+            >
+              Generate Plan →
+            </button>
+          </form>
+
+          {/* ── Output panel ──
+              Only rendered after the first submission. This is where the AI
+              response will eventually appear — for now it just echoes input. */}
+          {submitted && (
+            <div className="bg-white/10 border border-white/20 rounded-2xl p-6 space-y-4">
+              <h3 className="text-white font-semibold text-sm uppercase tracking-widest">
+                Your inputs
+              </h3>
+
+              <div className="space-y-3">
+                <div>
+                  <p className="text-white/50 text-xs uppercase tracking-wider mb-1">
+                    Interests
+                  </p>
+                  {/* Render each interest as a small chip */}
+                  <div className="flex flex-wrap gap-2">
+                    {submitted.interests.length > 0
+                      ? submitted.interests.map((interest) => (
+                          <span
+                            key={interest}
+                            className="bg-white/20 text-white text-xs font-medium px-3 py-1 rounded-full"
+                          >
+                            {interest}
+                          </span>
+                        ))
+                      : <span className="text-white/40 text-sm italic">None entered</span>
+                    }
+                  </div>
+                </div>
+
+                <div>
+                  <p className="text-white/50 text-xs uppercase tracking-wider mb-1">
+                    Workload
+                  </p>
+                  <p className="text-white text-sm">
+                    {/* Look up the human-readable label from the options list */}
+                    {WORKLOAD_OPTIONS.find((o) => o.value === submitted.workload)?.label
+                      ?? submitted.workload}
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+        </div>
+      </main>
+    </div>
   )
 }
 
