@@ -61,10 +61,42 @@ class AcademicHistory:
 # (how close the course is to what the student wants), while rating is
 # quality-based (higher is always better). Keeping them separate makes
 # it easy to add new signals (e.g., interest match, major relevance) later.
-INTEREST_WEIGHT = 0.4
-WEIGHT_DIFFICULTY = 0.25
-WEIGHT_WORKLOAD   = 0.25
-WEIGHT_RATING     = 0.10
+#
+# WHY these specific values:
+#   Interest is still the biggest signal (35%) since a course that's
+#   completely off-topic shouldn't score well even if the workload is perfect.
+#   Rating was bumped to 20% because it's the most objective quality signal
+#   we have — when all else is equal, students should get well-rated courses.
+#   Difficulty and workload are each 22.5% — meaningful but not overriding.
+INTEREST_WEIGHT   = 0.35
+WEIGHT_DIFFICULTY = 0.225
+WEIGHT_WORKLOAD   = 0.225
+WEIGHT_RATING     = 0.20
+
+# Synonym map: when a student types a natural-language interest, expand it
+# to the technical tags we use on courses. This bridges the gap between
+# "coding" (what students say) and "programming" (what our tags say).
+# Phase 2 will replace this with embedding-based similarity; for now a
+# manually curated map is cheap, transparent, and easy to extend.
+INTEREST_SYNONYMS: dict[str, list[str]] = {
+    "coding":       ["programming", "python", "java", "software", "computing", "code", "computer"],
+    "programming":  ["coding", "python", "java", "software", "computing", "code", "computer"],
+    "math":         ["mathematics", "calculus", "algebra", "statistics", "analysis", "proofs"],
+    "mathematics":  ["math", "calculus", "algebra", "statistics", "analysis", "proofs"],
+    "stats":        ["statistics", "data", "probability", "analysis"],
+    "data":         ["statistics", "data science", "machine learning", "analysis", "python"],
+    "ai":           ["machine learning", "artificial intelligence", "neural", "python", "data"],
+    "biology":      ["life sciences", "biochemistry", "molecular", "genetics", "cell"],
+    "chemistry":    ["organic", "inorganic", "biochemistry", "molecular", "reactions"],
+    "psychology":   ["behavior", "social-science", "mental", "cognition", "research"],
+    "writing":      ["english", "literature", "composition", "rhetoric", "essay"],
+    "history":      ["historical", "civilization", "political", "social"],
+    "economics":    ["micro", "macro", "finance", "markets", "policy"],
+    "business":     ["management", "finance", "marketing", "economics", "strategy"],
+    "design":       ["art", "visual", "creative", "ux", "interface"],
+    "networks":     ["systems", "computer", "distributed", "internet", "protocol"],
+    "security":     ["cryptography", "systems", "networks", "privacy", "cyber"],
+}
 
 # Scales for each field — used to normalize raw values to 0–10.
 DIFFICULTY_MIN, DIFFICULTY_MAX = 1, 10   # course.difficulty range
@@ -75,9 +107,46 @@ RATING_MIN,     RATING_MAX     = 1, 5    # course.rating range (e.g., UofT eval 
 # than penalizing it for lacking data.
 RATING_NEUTRAL = (RATING_MIN + RATING_MAX) / 2
 
-def _interest_score(course, interests):
-    matches = len(set(course.tags) & set(interests))
-    return (matches / len(course.tags)) * 10 if course.tags else 0
+def _interest_score(course: "Course", interests: list[str]) -> float:
+    """
+    Score how well a course matches the student's interests (0–10).
+
+    Matching works in two passes:
+      1. Synonym expansion: "coding" expands to ["programming", "python", ...]
+         so students don't need to know our internal tag vocabulary.
+      2. Text search: each (expanded) interest term is checked against the
+         course's tags AND its description words, case-insensitively.
+         This catches cases where the tag doesn't exist but the description
+         says "This course covers programming techniques…".
+
+    WHY divide by interests length (not tags length):
+        We want to reward courses that cover MANY of the student's interests,
+        not just courses with few tags (which would make narrow courses look better).
+        A course matching 2 out of 3 interests scores 6.67; one matching 1 out of 3
+        scores 3.33 — proportional to how much of the student's agenda it covers.
+    """
+    if not interests:
+        return 0.0
+
+    # Build a single lowercase blob of all searchable text for this course.
+    # We include tags, description, and the course code itself so that e.g.
+    # "CSC" in the name can be matched by a "computer science" interest expansion.
+    searchable = " ".join(course.tags + [course.description, course._name]).lower()
+
+    matched = 0
+    for raw_interest in interests:
+        interest = raw_interest.lower().strip()
+        if not interest:
+            continue
+
+        # Expand via synonym map, then also check the raw interest term itself.
+        expanded_terms = INTEREST_SYNONYMS.get(interest, []) + [interest]
+
+        # A single term match is enough to count this interest as satisfied.
+        if any(term in searchable for term in expanded_terms):
+            matched += 1
+
+    return (matched / len(interests)) * 10.0
 
 def _proximity_score(value: int | float, preferred: int | float, min_val: float, max_val: float) -> float:
     """
@@ -117,10 +186,10 @@ def score_course(course: "Course", preferences: dict) -> float:
         preferred_workload   (int, 1–5):  how much weekly effort they want
 
     Weights:
-        difficulty  25%  — proximity to preferred difficulty
-        workload    25%  — proximity to preferred workload
-        rating      10%  — normalized course rating (higher is always better)
-        interest    40%  — how well the course matches the student's interests
+        difficulty  22.5%  — proximity to preferred difficulty
+        workload    22.5%  — proximity to preferred workload
+        rating      20%  — normalized course rating (higher is always better)
+        interest    35%  — how well the course matches the student's interests
 
     Future signals (not yet implemented) will slot in here once we have
     interest vectors and program-fit data, and weights will be adjusted.
@@ -161,9 +230,17 @@ def recommend_courses(course_list: list["Course"], preferences: dict, top_n: int
     this function stays the same; only score_course changes.
     """
     eligible = [
-    c for c in course_list 
-    if c.is_eligible(preferences.get("completed_courses", []))]
+        c for c in course_list
+        if c.is_eligible(preferences.get("completed_courses", []))
+    ]
     scored = [(course, score_course(course, preferences)) for course in eligible]
+
+    # Filter out weak matches — showing a course with a score below 5 implies
+    # it's at least somewhat relevant, which is misleading to the student.
+    # If this filter removes everything (e.g. very niche input), the frontend
+    # should show a "no strong matches" message rather than low-scoring filler.
+    min_score = preferences.get("min_score", 5.0)
+    scored = [(course, score) for course, score in scored if score >= min_score]
 
     # Sort descending by score; use public getter for stable tiebreak ordering.
     scored.sort(key=lambda pair: (-pair[1], pair[0].get_name()))
@@ -224,7 +301,24 @@ def explain(course: "Course", preferences: dict) -> str:
         elif course.rating < 3.0:
             reasons.append(f"lower student rating ({course.rating}/5) — worth considering")
 
-    return ", ".join(reasons)
+    # --- Interest match ---
+    # Tell the student *why* this course appeared — or warn them if it's a
+    # weak interest match so they know to look closer before enrolling.
+    interests = preferences.get("interests", [])
+    if interests:
+        # Reuse the same expanded-term logic from _interest_score so the
+        # explanation is always consistent with the actual score.
+        searchable = " ".join(course.tags + [course.description, course._name]).lower()
+        matched_interests = [
+            i for i in interests
+            if any(t in searchable for t in INTEREST_SYNONYMS.get(i.lower().strip(), []) + [i.lower().strip()])
+        ]
+        if matched_interests:
+            reasons.append(f"aligns with your interest in {', '.join(matched_interests)}")
+        else:
+            reasons.append("does not directly match your stated interests — consider as a breadth requirement")
+
+    return ", ".join(reasons) if reasons else "No specific reasons found."
 
 
 courses = [

@@ -1,5 +1,5 @@
 # Remember to call venv/Scripts/activate to get here
-# Also run uvicorn main:app --reload
+# Also run uvicorn main:app --reload --port 8000
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
