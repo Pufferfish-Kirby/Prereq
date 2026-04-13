@@ -3,6 +3,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from scoring import recommend_courses, explain, courses as course_catalog
 
 # FastAPI() — note the parentheses. Without them `app` would be the class itself,
 # not an instance, so every method call below would crash at startup.
@@ -26,10 +27,27 @@ app.add_middleware(
 
 class RequestData(BaseModel):
     interests: list[str]
-    workload: str
+    preferred_difficulty: int
+    preferred_workload: int
+    completed_courses: list[str] = []
 
 @app.post("/recommend")
-def recommend(data: RequestData) -> dict:
-    return {
-        "courses": ["CSC108", "MAT137"]
+def recommend(data: RequestData) -> list:
+    preferences = {
+        "interests": data.interests,
+        "preferred_difficulty": data.preferred_difficulty,
+        "preferred_workload": data.preferred_workload,
+        "completed_courses": data.completed_courses,
     }
+    # Pass the full course catalog, not completed_courses — completed_courses
+    # is used inside recommend_courses to filter out ineligible courses via is_eligible().
+    courses = recommend_courses(course_catalog, preferences)
+    result = []
+    for course, score in courses:
+        result.append({
+            # Use get_name() because __init__ stores the name as self._name
+            "name": course.get_name(),
+            "score": score,
+            "explanation": explain(course, preferences),
+        })
+    return result

@@ -11,9 +11,21 @@ class Course:
     difficulty: int
     rating: float
     reviews: list[str]
-    def __init__(self, name: str, tags: list[str], description: str, prerequisites: list[str] = None, corequisites: list[str] = None, credits: float = 0.5, workload: int = 3, difficulty: int = 5, rating: float = None, reviews: list[str] = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        tags: list[str] | None = None,
+        prerequisites: list[str] | None = None,
+        corequisites: list[str] | None = None,
+        credits: float = 0.5,
+        workload: int = 3,
+        difficulty: int = 5,
+        rating: float | None = None,
+        reviews: list[str] | None = None,
+    ) -> None:
         self._name = name
-        self.tags = tags
+        self.tags = tags if tags is not None else []
         self.description = description
         self.prerequisites = prerequisites if prerequisites is not None else []
         self.corequisites = corequisites if corequisites is not None else []
@@ -49,10 +61,10 @@ class AcademicHistory:
 # (how close the course is to what the student wants), while rating is
 # quality-based (higher is always better). Keeping them separate makes
 # it easy to add new signals (e.g., interest match, major relevance) later.
-INTEREST_WEIGHT = 0.35
+INTEREST_WEIGHT = 0.4
 WEIGHT_DIFFICULTY = 0.25
 WEIGHT_WORKLOAD   = 0.25
-WEIGHT_RATING     = 0.15
+WEIGHT_RATING     = 0.10
 
 # Scales for each field — used to normalize raw values to 0–10.
 DIFFICULTY_MIN, DIFFICULTY_MAX = 1, 10   # course.difficulty range
@@ -107,8 +119,8 @@ def score_course(course: "Course", preferences: dict) -> float:
     Weights:
         difficulty  25%  — proximity to preferred difficulty
         workload    25%  — proximity to preferred workload
-        rating      15%  — normalized course rating (higher is always better)
-        interest    35%  — how well the course matches the student's interests
+        rating      10%  — normalized course rating (higher is always better)
+        interest    40%  — how well the course matches the student's interests
 
     Future signals (not yet implemented) will slot in here once we have
     interest vectors and program-fit data, and weights will be adjusted.
@@ -153,8 +165,8 @@ def recommend_courses(course_list: list["Course"], preferences: dict, top_n: int
     if c.is_eligible(preferences.get("completed_courses", []))]
     scored = [(course, score_course(course, preferences)) for course in eligible]
 
-    # Sort descending by score; use course name as tiebreaker for stable ordering.
-    scored.sort(key=lambda pair: (-pair[1], pair[0].name))
+    # Sort descending by score; use public getter for stable tiebreak ordering.
+    scored.sort(key=lambda pair: (-pair[1], pair[0].get_name()))
 
     return scored[:top_n] if top_n is not None else scored
 
@@ -216,10 +228,65 @@ def explain(course: "Course", preferences: dict) -> str:
 
 
 courses = [
-    Course(name="CSC108H1", description="Introduction to Computer Science", prerequisites=[], corequisites=[], credits=0.5, workload=3, difficulty=5, rating=None, reviews=None),
-    Course(name="MAT137Y1", description="Calculus with Proofs", prerequisites=[], corequisites=[], credits=1.0, workload=3, difficulty=5, rating=None, reviews=None),
-    Course(name="PSY100H1", description="Introduction to Psychology", prerequisites=[], corequisites=[], credits=0.5, workload=3, difficulty=5, rating=None, reviews=None),
-    Course(name="MAT135H1", description="Calculus I", prerequisites=[], corequisites=[], credits=0.5, workload=3, difficulty=5, rating=None, reviews=None),
-    Course(name="MAT136H1", description="Calculus II", prerequisites=["MAT135H1"], corequisites=[], credits=0.5, workload=3, difficulty=5, rating=None, reviews=None),
+    Course(
+        name="CSC108H1",
+        description="Introduction to Computer Science",
+        tags=["programming", "python", "computing", "problem-solving"],
+        prerequisites=[],
+        corequisites=[],
+        credits=0.5,
+        workload=3,
+        difficulty=5,
+        rating=None,
+        reviews=None,
+    ),
+    Course(
+        name="MAT137Y1",
+        description="Calculus with Proofs",
+        tags=["calculus", "proofs", "mathematics", "theory"],
+        prerequisites=[],
+        corequisites=[],
+        credits=1.0,
+        workload=4,
+        difficulty=7,
+        rating=None,
+        reviews=None,
+    ),
+    Course(
+        name="PSY100H1",
+        description="Introduction to Psychology",
+        tags=["psychology", "behavior", "social-science", "research"],
+        prerequisites=[],
+        corequisites=[],
+        credits=0.5,
+        workload=2,
+        difficulty=4,
+        rating=None,
+        reviews=None,
+    ),
+    Course(
+        name="MAT135H1",
+        description="Calculus I",
+        tags=["calculus", "algebra", "mathematics", "analysis"],
+        prerequisites=[],
+        corequisites=[],
+        credits=0.5,
+        workload=3,
+        difficulty=5,
+        rating=None,
+        reviews=None,
+    ),
+    Course(
+        name="MAT136H1",
+        description="Calculus II",
+        tags=["calculus", "integration", "mathematics", "applications"],
+        prerequisites=["MAT135H1"],
+        corequisites=[],
+        credits=0.5,
+        workload=3,
+        difficulty=6,
+        rating=None,
+        reviews=None,
+    ),
 ]
 

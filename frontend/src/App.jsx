@@ -1,13 +1,21 @@
 import { useState } from 'react'
 import './App.css'
 
-// Workload options map course-load intensity to a human-readable label.
-// These will eventually feed into the AI planner's constraint system.
+// Workload maps weekly effort preference to the 1–5 integer scale the backend uses.
+// 1 = very light, 5 = very heavy — stored as numbers so they feed directly into scoring.
 const WORKLOAD_OPTIONS = [
   { value: '', label: 'Select a workload...' },
-  { value: 'light', label: 'Light (3–4 courses/semester)' },
-  { value: 'standard', label: 'Standard (5 courses/semester)' },
-  { value: 'heavy', label: 'Heavy (6 courses/semester)' },
+  { value: 2, label: 'Light' },
+  { value: 3, label: 'Standard' },
+  { value: 5, label: 'Heavy' },
+]
+
+// Difficulty maps how challenging the student wants courses to the 1–10 scale the backend uses.
+const DIFFICULTY_OPTIONS = [
+  { value: '', label: 'Select a difficulty...' },
+  { value: 2, label: 'Easy' },
+  { value: 5, label: 'Medium' },
+  { value: 8, label: 'Hard' },
 ]
 
 function App() {
@@ -15,6 +23,7 @@ function App() {
   // that a single object would just add boilerplate.
   const [interests, setInterests] = useState('')
   const [workload, setWorkload] = useState('')
+  const [difficulty, setDifficulty] = useState('')
 
   // Submitted snapshot — null until the user hits "Generate Plan".
   // Separating "live form state" from "submitted state" prevents the
@@ -39,18 +48,24 @@ function App() {
       .map((s) => s.trim())
       .filter(Boolean)
 
-    setSubmitted({ interests: parsedInterests, workload })
+    setSubmitted({ interests: parsedInterests, workload, difficulty })
     setCourses(null)
     setError(null)
     setLoading(true)
 
     try {
       // POST to the FastAPI backend running on port 8000.
-      // The body shape must match the RequestData Pydantic model in main.py.
+      // The body shape must match the RequestData Pydantic model in main.py:
+      //   interests (list[str]), preferred_difficulty (int), preferred_workload (int)
       const response = await fetch('http://localhost:8000/recommend', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ interests: parsedInterests, workload }),
+        body: JSON.stringify({
+          interests: parsedInterests,
+          preferred_difficulty: Number(difficulty),
+          preferred_workload: Number(workload),
+          completed_courses: [],
+        }),
       })
 
       if (!response.ok) {
@@ -59,8 +74,8 @@ function App() {
       }
 
       const data = await response.json()
-      // data.courses is the array from the backend, e.g. ["CSC108", "MAT137"]
-      setCourses(data.courses)
+      // Backend returns the array directly: [{ name, score, explanation }, ...]
+      setCourses(data)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -129,7 +144,35 @@ function App() {
               </p>
             </div>
 
-            {/* Workload dropdown */}
+            {/* Difficulty dropdown — maps to a 1–10 int for the scoring engine */}
+            <div className="space-y-2">
+              <label
+                htmlFor="difficulty"
+                className="block text-sm font-semibold text-uoft-blue"
+              >
+                Preferred difficulty
+              </label>
+              <select
+                id="difficulty"
+                value={difficulty}
+                onChange={(e) => setDifficulty(e.target.value)}
+                required
+                className="
+                  w-full rounded-lg border border-gray-200 px-4 py-3
+                  text-sm text-gray-800
+                  focus:outline-none focus:ring-2 focus:ring-uoft-blue/40 focus:border-uoft-blue
+                  transition appearance-none bg-white
+                "
+              >
+                {DIFFICULTY_OPTIONS.map(({ value, label }) => (
+                  <option key={value} value={value} disabled={value === ''}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Workload dropdown — maps to a 1–5 int for the scoring engine */}
             <div className="space-y-2">
               <label
                 htmlFor="workload"
@@ -191,16 +234,28 @@ function App() {
                 <p className="text-red-300 text-sm">{error}</p>
               )}
 
-              {/* Course chips — one per course code returned by the backend */}
+              {/* Course cards — one per result from the backend.
+                  Each item has { name, score, explanation } from the scoring engine. */}
               {courses && (
-                <div className="flex flex-wrap gap-2">
+                <div className="space-y-3">
                   {courses.map((course) => (
-                    <span
-                      key={course}
-                      className="bg-white/20 text-white text-xs font-medium px-3 py-1 rounded-full"
+                    <div
+                      key={course.name}
+                      className="bg-white/10 border border-white/20 rounded-xl px-4 py-3 flex items-start gap-4"
                     >
-                      {course}
-                    </span>
+                      {/* Score badge — the 0–10 number from score_course() */}
+                      <div className="shrink-0 w-10 h-10 rounded-full bg-white/20 flex items-center justify-center">
+                        <span className="text-white text-xs font-bold">{course.score}</span>
+                      </div>
+
+                      <div className="min-w-0">
+                        <p className="text-white font-semibold text-sm">{course.name}</p>
+                        {/* Explanation is the plain-English string from explain() in scoring.py */}
+                        <p className="text-white/60 text-xs mt-0.5 leading-relaxed">
+                          {course.explanation || 'No specific reasons found.'}
+                        </p>
+                      </div>
+                    </div>
                   ))}
                 </div>
               )}
