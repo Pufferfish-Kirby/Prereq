@@ -3,7 +3,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from scoring import recommend_courses, explain, courses as course_catalog
+from scoring import recommend_courses, explain, explain_structured, courses as course_catalog
 
 # FastAPI() — note the parentheses. Without them `app` would be the class itself,
 # not an instance, so every method call below would crash at startup.
@@ -48,6 +48,10 @@ def recommend(data: RequestData) -> list:
             # Use get_name() because __init__ stores the name as self._name
             "name": course.get_name(),
             "score": score,
+            # Plain string kept for backwards-compatibility / debugging in the future.
             "explanation": explain(course, preferences),
+            # Structured list of { type, message, positive } objects — the frontend
+            # uses this to render colour-coded reason chips instead of raw text.
+            "reasons": explain_structured(course, preferences),
         })
     return result

@@ -256,6 +256,114 @@ _WORKLOAD_MATCH_THRESHOLD   = 1   # out of a 1–5 scale
 _GOOD_RATING_THRESHOLD      = 4.0 # out of 5 — "well rated"
 
 
+def explain_structured(course: "Course", preferences: dict) -> list[dict]:
+    """
+    Same logic as explain(), but returns a list of structured reason objects
+    instead of a single joined string.
+
+    WHY structured instead of a flat string:
+        A plain string forces the frontend to parse meaning back out of English
+        prose — fragile and unextendable. Structured reasons let the UI render
+        each signal with its own icon, colour, or tooltip without any string splitting.
+
+    Each reason dict has:
+        type     (str)  — "difficulty" | "workload" | "rating" | "interest"
+                          Lets the frontend pick an icon or colour per category.
+        message  (str)  — the same human-readable phrase from explain()
+        positive (bool) — True means "this is a green/positive signal",
+                          False means "worth noting but cautionary".
+                          The frontend uses this to decide chip colour.
+
+    The list is ordered: difficulty → workload → rating → interest,
+    matching the order in explain() so both outputs feel consistent.
+    """
+    reasons: list[dict] = []
+
+    preferred_difficulty = preferences.get("preferred_difficulty", 5)
+    preferred_workload   = preferences.get("preferred_workload", 3)
+
+    # --- Difficulty ---
+    diff_gap = abs(course.difficulty - preferred_difficulty)
+    if diff_gap <= _DIFFICULTY_MATCH_THRESHOLD:
+        reasons.append({
+            "type": "difficulty",
+            "message": "matches your preferred difficulty level",
+            "positive": True,
+        })
+    elif course.difficulty < preferred_difficulty:
+        reasons.append({
+            "type": "difficulty",
+            "message": "lighter than your usual preference (good for a busy semester)",
+            "positive": True,
+        })
+    else:
+        reasons.append({
+            "type": "difficulty",
+            "message": "more challenging than your preference (great if you want a stretch)",
+            "positive": False,
+        })
+
+    # --- Workload ---
+    work_gap = abs(course.workload - preferred_workload)
+    if work_gap <= _WORKLOAD_MATCH_THRESHOLD:
+        reasons.append({
+            "type": "workload",
+            "message": "fits your workload preference",
+            "positive": True,
+        })
+    elif course.workload < preferred_workload:
+        reasons.append({
+            "type": "workload",
+            "message": "lower workload than you requested",
+            "positive": True,
+        })
+    else:
+        reasons.append({
+            "type": "workload",
+            "message": "heavier workload than you requested",
+            "positive": False,
+        })
+
+    # --- Rating ---
+    # Same silence rule as explain(): only surface rating when it's notable.
+    if course.rating is not None:
+        if course.rating >= _GOOD_RATING_THRESHOLD:
+            reasons.append({
+                "type": "rating",
+                "message": f"well rated by students ({course.rating}/5)",
+                "positive": True,
+            })
+        elif course.rating < 3.0:
+            reasons.append({
+                "type": "rating",
+                "message": f"lower student rating ({course.rating}/5) — worth considering",
+                "positive": False,
+            })
+
+    # --- Interest match ---
+    interests = preferences.get("interests", [])
+    if interests:
+        searchable = " ".join(course.tags + [course.description, course._name]).lower()
+        matched_interests = [
+            i for i in interests
+            if any(t in searchable for t in INTEREST_SYNONYMS.get(i.lower().strip(), []) + [i.lower().strip()])
+        ]
+        if matched_interests:
+            reasons.append({
+                "type": "interest",
+                "message": f"aligns with your interest in {', '.join(matched_interests)}",
+                "positive": True,
+            })
+        else:
+            reasons.append({
+                "type": "interest",
+                "message": "does not directly match your stated interests — consider as a breadth requirement",
+                "positive": False,
+            })
+
+    return reasons
+
+
 def explain(course: "Course", preferences: dict) -> str:
     """
     Generate a plain-English explanation of why a course was recommended.

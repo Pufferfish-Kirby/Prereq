@@ -235,7 +235,7 @@ function App() {
               )}
 
               {/* Course cards — one per result from the backend.
-                  Each item has { name, score, explanation } from the scoring engine. */}
+                  Each item has { name, score, explanation, reasons } from the scoring engine. */}
               {courses && (
                 <div className="space-y-3">
                   {courses.map((course) => (
@@ -248,12 +248,31 @@ function App() {
                         <span className="text-white text-xs font-bold">{course.score}</span>
                       </div>
 
-                      <div className="min-w-0">
+                      <div className="min-w-0 flex-1">
                         <p className="text-white font-semibold text-sm">{course.name}</p>
-                        {/* Explanation is the plain-English string from explain() in scoring.py */}
-                        <p className="text-white/60 text-xs mt-0.5 leading-relaxed">
-                          {course.explanation || 'No specific reasons found.'}
-                        </p>
+
+                        {/* Reason chips — each reason from explain_structured() gets its own
+                            pill. Green bg = positive signal, amber bg = cautionary signal.
+                            This is much more scannable than one long comma-joined sentence. */}
+                        {course.reasons && course.reasons.length > 0 ? (
+                          <div className="flex flex-wrap gap-1.5 mt-2">
+                            {course.reasons.map((reason, idx) => (
+                              <span
+                                key={idx}
+                                className={`
+                                  inline-block rounded-full px-2.5 py-0.5 text-xs font-medium
+                                  ${reason.positive
+                                    ? 'bg-green-500/20 text-green-200'
+                                    : 'bg-amber-500/20 text-amber-200'}
+                                `}
+                              >
+                                {reason.message}
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-white/60 text-xs mt-0.5">No specific reasons found.</p>
+                        )}
                       </div>
                     </div>
                   ))}
