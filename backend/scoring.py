@@ -32,7 +32,7 @@ class Course:
     def get_credits(self) -> float:
         return self._credits
     def is_eligible(self, completed: list[str]) -> bool:
-        return all(prereq in completed for prereq in self.prerequisites)
+        return all(prereq in completed for prereq in self._prerequisites)
 
 class AcademicHistory:  # this is here once we can link the history to get courses they can take/can't take
     courses: list[Course]
