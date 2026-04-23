@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import './App.css'
 
 // Workload maps weekly effort preference to the 1–5 integer scale the backend uses.
@@ -19,23 +19,69 @@ const DIFFICULTY_OPTIONS = [
 ]
 
 function App() {
-  // Form field state — kept flat because this form is simple enough
-  // that a single object would just add boilerplate.
+  // Which tab is active: 'planner' (the existing form) or 'chat'
+  const [activeTab, setActiveTab] = useState('planner')
+
+  // ── Planner tab state ──
   const [interests, setInterests] = useState('')
   const [workload, setWorkload] = useState('')
   const [difficulty, setDifficulty] = useState('')
-
-  // Submitted snapshot — null until the user hits "Generate Plan".
-  // Separating "live form state" from "submitted state" prevents the
-  // output panel from updating on every keystroke.
   const [submitted, setSubmitted] = useState(null)
-
-  // courses holds the array returned by the backend, e.g. ["CSC108", "MAT137"].
-  // Kept separate from `submitted` so we can show a loading state between
-  // the form submit and the API response arriving.
   const [courses, setCourses] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
+
+  // ── Chat tab state ──
+  // messages is the full conversation history shown in the UI and sent to /chat
+  // so the backend can give context-aware responses across multiple turns.
+  const [messages, setMessages] = useState([])
+  const [inputValue, setInputValue] = useState('')
+  const [chatLoading, setChatLoading] = useState(false)
+  const [chatError, setChatError] = useState(null)
+
+  // Ref to the bottom of the message list — we scroll to it after each new message
+  // so the user always sees the latest response without manually scrolling.
+  const messagesEndRef = useRef(null)
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages, chatLoading])
+
+  async function handleChatSend(e) {
+    e.preventDefault()
+    const text = inputValue.trim()
+    if (!text || chatLoading) return
+
+    // Optimistically add the user message to the UI before the response arrives
+    const userMsg = { role: 'user', content: text }
+    const updatedHistory = [...messages, userMsg]
+    setMessages(updatedHistory)
+    setInputValue('')
+    setChatError(null)
+    setChatLoading(true)
+
+    try {
+      const response = await fetch('http://localhost:8000/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // Send the full history so Claude can refer to earlier turns.
+        // We exclude the just-added userMsg from history and pass it as `message`
+        // to match the ChatRequest schema: { message, history: prior turns }.
+        body: JSON.stringify({
+          message: text,
+          history: messages, // prior turns only, not the one we just added
+        }),
+      })
+
+      if (!response.ok) throw new Error(`Server error: ${response.status}`)
+
+      const data = await response.json()
+      setMessages([...updatedHistory, { role: 'assistant', content: data.response }])
+    } catch (err) {
+      setChatError(err.message)
+    } finally {
+      setChatLoading(false)
+    }
+  }
 
   async function handleSubmit(e) {
     // Prevent the default browser form navigation
@@ -89,15 +135,124 @@ function App() {
 
       {/* ── Navbar ── */}
       <header className="bg-uoft-blue border-b border-white/20 px-8 py-4 flex items-center gap-3">
-        {/* The thick left border acts as a quick visual accent without needing an image */}
         <div className="w-1 h-8 bg-white rounded-full" />
         <h1 className="text-white text-xl font-semibold tracking-wide">MyUofT</h1>
         <span className="text-white/50 text-sm ml-1">/ Course Planner</span>
+
+        {/* Tab switcher in the navbar — right-aligned */}
+        <div className="ml-auto flex gap-1 bg-white/10 rounded-lg p-1">
+          {['planner', 'chat'].map((tab) => (
+            <button
+              key={tab}
+              onClick={() => setActiveTab(tab)}
+              className={`
+                px-4 py-1.5 rounded-md text-sm font-medium capitalize transition-all
+                ${activeTab === tab
+                  ? 'bg-white text-uoft-blue shadow'
+                  : 'text-white/70 hover:text-white'}
+              `}
+            >
+              {tab === 'chat' ? 'AI Advisor' : 'Course Planner'}
+            </button>
+          ))}
+        </div>
       </header>
 
       {/* ── Main content ── */}
       <main className="flex-1 flex items-center justify-center px-4 py-12">
         <div className="w-full max-w-lg space-y-8">
+
+        {/* ══════════════════════════════════════════
+            CHAT TAB
+            A scrollable message history + input bar.
+            Shown when activeTab === 'chat'.
+        ══════════════════════════════════════════ */}
+        {activeTab === 'chat' && (
+          <div className="flex flex-col h-[70vh]">
+            <div className="text-center mb-6">
+              <h2 className="text-white text-3xl font-bold tracking-tight">AI Advisor</h2>
+              <p className="text-white/60 mt-2 text-sm">
+                Ask anything about UofT courses, programs, or degree requirements.
+              </p>
+            </div>
+
+            {/* Scrollable message list */}
+            <div className="flex-1 overflow-y-auto space-y-3 pr-1 mb-4">
+              {messages.length === 0 && (
+                <p className="text-white/40 text-sm text-center mt-8 italic">
+                  No messages yet — say hello!
+                </p>
+              )}
+
+              {messages.map((msg, idx) => (
+                <div
+                  key={idx}
+                  className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                >
+                  <div
+                    className={`
+                      max-w-[80%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed
+                      ${msg.role === 'user'
+                        ? 'bg-white text-uoft-blue rounded-br-sm'
+                        : 'bg-white/15 text-white rounded-bl-sm'}
+                    `}
+                  >
+                    {msg.content}
+                  </div>
+                </div>
+              ))}
+
+              {/* Typing indicator — shown while waiting for Claude's response */}
+              {chatLoading && (
+                <div className="flex justify-start">
+                  <div className="bg-white/15 text-white/60 rounded-2xl rounded-bl-sm px-4 py-2.5 text-sm italic">
+                    Thinking...
+                  </div>
+                </div>
+              )}
+
+              {chatError && (
+                <p className="text-red-300 text-xs text-center">{chatError}</p>
+              )}
+
+              {/* Invisible anchor we scroll into view after each message */}
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* Input bar */}
+            <form onSubmit={handleChatSend} className="flex gap-2">
+              <input
+                type="text"
+                value={inputValue}
+                onChange={(e) => setInputValue(e.target.value)}
+                placeholder="Ask about courses, prerequisites, programs..."
+                disabled={chatLoading}
+                className="
+                  flex-1 rounded-xl border border-white/20 bg-white/10 text-white
+                  placeholder-white/40 px-4 py-3 text-sm
+                  focus:outline-none focus:ring-2 focus:ring-white/30
+                  disabled:opacity-50 transition
+                "
+              />
+              <button
+                type="submit"
+                disabled={chatLoading || !inputValue.trim()}
+                className="
+                  bg-white text-uoft-blue font-semibold rounded-xl px-5 py-3 text-sm
+                  hover:bg-white/90 active:scale-[0.97] transition-all
+                  disabled:opacity-40 disabled:cursor-not-allowed
+                "
+              >
+                Send
+              </button>
+            </form>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════
+            PLANNER TAB — existing form, unchanged
+        ══════════════════════════════════════════ */}
+        {activeTab === 'planner' && (<>
 
           {/* Page heading */}
           <div className="text-center">
@@ -224,18 +379,14 @@ function App() {
                 Recommended Courses
               </h3>
 
-              {/* Loading spinner — shown while waiting for the API response */}
               {loading && (
                 <p className="text-white/60 text-sm italic">Loading...</p>
               )}
 
-              {/* Error state — surface API/network errors visibly during dev */}
               {error && (
                 <p className="text-red-300 text-sm">{error}</p>
               )}
 
-              {/* Course cards — one per result from the backend.
-                  Each item has { name, score, explanation, reasons } from the scoring engine. */}
               {courses && (
                 <div className="space-y-3">
                   {courses.map((course) => (
@@ -243,7 +394,6 @@ function App() {
                       key={course.name}
                       className="bg-white/10 border border-white/20 rounded-xl px-4 py-3 flex items-start gap-4"
                     >
-                      {/* Score badge — the 0–10 number from score_course() */}
                       <div className="shrink-0 w-10 h-10 rounded-full bg-white/20 flex items-center justify-center">
                         <span className="text-white text-xs font-bold">{course.score}</span>
                       </div>
@@ -251,9 +401,6 @@ function App() {
                       <div className="min-w-0 flex-1">
                         <p className="text-white font-semibold text-sm">{course.name}</p>
 
-                        {/* Reason chips — each reason from explain_structured() gets its own
-                            pill. Green bg = positive signal, amber bg = cautionary signal.
-                            This is much more scannable than one long comma-joined sentence. */}
                         {course.reasons && course.reasons.length > 0 ? (
                           <div className="flex flex-wrap gap-1.5 mt-2">
                             {course.reasons.map((reason, idx) => (
@@ -280,6 +427,8 @@ function App() {
               )}
             </div>
           )}
+        </>)}
+        {/* end activeTab === 'planner' */}
 
         </div>
       </main>
