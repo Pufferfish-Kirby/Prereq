@@ -216,6 +216,9 @@ frontend/dist/
 # Local env files
 .env.local
 .env.*.local
+.env.example
 
 TOOLS_AND_SETUP.md
 AI_MODEL_GUIDE.md
+keys.txt
+test_claude.py

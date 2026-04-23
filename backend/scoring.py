@@ -293,7 +293,7 @@ def explain_structured(course: "Course", preferences: dict) -> list[dict]:
 
     # --- Workload ---
     work_gap = abs(course.workload - preferred_workload)
-    if work_gap == _WORKLOAD_MATCH_THRESHOLD:
+    if work_gap <= _WORKLOAD_MATCH_THRESHOLD:
         reasons.append({
             "type": "workload",
             "message": "fits your workload preference",
