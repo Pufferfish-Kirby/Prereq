@@ -222,3 +222,7 @@ TOOLS_AND_SETUP.md
 AI_MODEL_GUIDE.md
 keys.txt
 test_claude.py
+backend/courses.json
+backend/courses_slim.json
+backend/data_pulling.py
+backend/practice.py

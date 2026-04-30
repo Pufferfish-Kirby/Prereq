@@ -100,7 +100,7 @@ def recommend(data: RequestData) -> list:
     for course, score in courses:
         result.append({
             # Use get_name() because __init__ stores the name as self._name
-            "name": course.get_name(),
+            "name": course.get_course_code(),
             "score": score,
             # Plain string kept for backwards-compatibility / debugging in the future.
             "explanation": explain(course, preferences),

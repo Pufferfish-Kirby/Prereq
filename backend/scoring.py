@@ -1,28 +1,38 @@
 # ok this is where we will define our scoring system
+import json
+import re
+
+with open("courses_slim.json", "r", encoding="utf-8") as file:  # since its utf-8 have to include the encoding
+    data = json.load(file)
+
 class Course:
     def __init__(self,
+        code: str,
         name: str,
         description: str,
         tags: list[str] | None = None,
-        prerequisites: list[str] | None = None,
-        corequisites: list[str] | None = None,
+        prerequisites: str | None = None,
+        corequisites: str | None = None,
         credits: float = 0.5,
         workload: int = 3,
         difficulty: int = 5,
         rating: float | None = None,
         reviews: list[str] | None = None,
     ) -> None:
+        self._code = code
         self._name = name
         self.tags = tags if tags is not None else []
         self.description = description
-        self._prerequisites = prerequisites if prerequisites is not None else []
-        self._corequisites = corequisites if corequisites is not None else []
+        self._prerequisites = prerequisites if prerequisites is not None else ""
+        self._corequisites = corequisites if corequisites is not None else ""
         self._credits = credits
         self.workload = workload
         self.difficulty = difficulty
         self.rating = rating
         self.reviews = reviews if reviews is not None else []
     
+    def get_course_code(self) -> str:
+        return self._code
     def get_name(self) -> str:
         return self._name
     def get_prerequisites(self) -> list[str]:
@@ -45,17 +55,7 @@ class AcademicHistory:  # this is here once we can link the history to get cours
     def add_course(self, course: Course) -> None:
         self._courses.append(course)
 
-# Weights must sum to 1.0. Difficulty and workload are proximity-based
-# (how close the course is to what the student wants), while rating is
-# quality-based (higher is always better). Keeping them separate makes
-# it easy to add new signals (e.g., interest match, major relevance) later.
-#
-# WHY these specific values:
-#   Interest is still the biggest signal (35%) since a course that's
-#   completely off-topic shouldn't score well even if the workload is perfect.
-#   Rating was bumped to 20% because it's the most objective quality signal
-#   we have — when all else is equal, students should get well-rated courses.
-#   Difficulty and workload are each 22.5% — meaningful but not overriding.
+# Weightings
 INTEREST_WEIGHT   = 0.35
 WEIGHT_DIFFICULTY = 0.225
 WEIGHT_WORKLOAD   = 0.225
@@ -69,11 +69,14 @@ WEIGHT_RATING     = 0.20
 INTEREST_SYNONYMS: dict[str, list[str]] = {
     "coding":       ["programming", "python", "java", "software", "computing", "code", "computer"],
     "programming":  ["coding", "python", "java", "software", "computing", "code", "computer"],
-    "math":         ["mathematics", "calculus", "algebra", "statistics", "analysis", "proofs"],
-    "mathematics":  ["math", "calculus", "algebra", "statistics", "analysis", "proofs"],
-    "stats":        ["statistics", "data", "probability", "analysis"],
-    "data":         ["statistics", "data science", "machine learning", "analysis", "python"],
-    "ai":           ["machine learning", "artificial intelligence", "neural", "python", "data"],
+    "math":         ["mathematics", "calculus", "algebra", "statistics", "analysis", "proofs", "proof",
+                     "theorem", "discrete", "linear", "differential", "logic", "rigorous", "number theory"],
+    "mathematics":  ["math", "calculus", "algebra", "statistics", "analysis", "proofs", "proof",
+                     "theorem", "discrete", "linear", "differential", "logic", "rigorous"],
+    "stats":        ["statistics", "probability", "analysis", "stochastic", "inference", "regression"],
+    "data":         ["statistics", "data science", "machine learning", "analysis", "python", "dataset"],
+    "ai":           ["machine learning", "artificial intelligence", "neural", "deep learning",
+                     "natural language", "computer vision", "reinforcement", "prediction"],
     "biology":      ["life sciences", "biochemistry", "molecular", "genetics", "cell"],
     "chemistry":    ["organic", "inorganic", "biochemistry", "molecular", "reactions"],
     "psychology":   ["behavior", "social-science", "mental", "cognition", "research"],
@@ -94,6 +97,21 @@ RATING_MIN,     RATING_MAX     = 1, 5    # course.rating range (e.g., UofT eval 
 # When a course has no rating yet, we assume a neutral mid-point rather
 # than penalizing it for lacking data.
 RATING_NEUTRAL = (RATING_MIN + RATING_MAX) / 2
+
+# JSON TO COURSE CONVERSION
+courses = []  
+for c in data:
+    # tags: department + breadth requirements give cheap topic signals without a tagging pipeline
+    pseudo_tags = [c.get('department', '')] + c.get('breadth_requirements', [])
+    courses.append(Course(
+        c['code'],
+        c['name'],           # English title e.g. "Calculus and Analysis I" — richest keyword source
+        c['description'],
+        tags=pseudo_tags,
+        prerequisites=c['prerequisites'],
+        corequisites=c['corequisites'],
+        credits=c['credit_value'],
+    ))
 
 def _interest_score(course: "Course", interests: list[str]) -> float:
     """
@@ -116,25 +134,41 @@ def _interest_score(course: "Course", interests: list[str]) -> float:
     if not interests:
         return 0.0
 
-    # Build a single lowercase blob of all searchable text for this course.
-    # We include tags, description, and the course code itself so that e.g.
-    # "CSC" in the name can be matched by a "computer science" interest expansion.
-    searchable = " ".join(course.tags + [course.description, course.get_name]).lower()
+    # Search three fields separately so we can weight by signal strength.
+    # WHY: a binary "anywhere in the text" match treats CSC108's title "Computer
+    # Programming" the same as a chemistry course that incidentally mentions
+    # "software" once in its description. Title hits are near-definitive;
+    # description hits are weak evidence at best.
+    title_blob = (course.get_name() + " " + course.get_course_code()).lower()
+    tags_blob  = " ".join(course.tags).lower()        # department + breadth requirements
+    desc_blob  = course.description.lower()
 
-    matched = 0
+    # Per-field weights. Title=1.0 means a single title hit alone gives full
+    # credit for that interest; description=0.4 means a description-only hit
+    # is real but soft evidence. Tags (department) sit in between.
+    TITLE_W, TAGS_W, DESC_W = 1.0, 0.7, 0.4
+
+    total = 0.0
     for raw_interest in interests:
         interest = raw_interest.lower().strip()
         if not interest:
             continue
 
-        # Expand via synonym map, then also check the raw interest term itself.
         expanded_terms = INTEREST_SYNONYMS.get(interest, []) + [interest]
 
-        # A single term match is enough to count this interest as satisfied.
-        if any(term in searchable for term in expanded_terms):
-            matched += 1
+        # Take the strongest field where any synonym hits — don't double-count
+        # the same interest just because it appears in multiple fields.
+        best = 0.0
+        for term in expanded_terms:
+            if term in title_blob:
+                best = max(best, TITLE_W)
+            elif term in tags_blob:
+                best = max(best, TAGS_W)
+            elif term in desc_blob:
+                best = max(best, DESC_W)
+        total += best
 
-    return (matched / len(interests)) * 10.0
+    return min(10.0, (total / len(interests)) * 10.0)
 
 def _proximity_score(value: int | float, preferred: int | float, min_val: float, max_val: float) -> float:
     """
@@ -201,7 +235,7 @@ def score_course(course: "Course", preferences: dict) -> float:
     return round(max(0.0, min(10.0, raw)), 1)
 
 
-def recommend_courses(course_list: list["Course"], preferences: dict, top_n: int = None) -> list[tuple["Course", float]]:
+def recommend_courses(course_list: list["Course"], preferences: dict, top_n: int = 5) -> list[tuple["Course", float]]:
     """
     Return courses sorted by their score (highest first).
 
@@ -231,7 +265,7 @@ def recommend_courses(course_list: list["Course"], preferences: dict, top_n: int
     scored = [(course, score) for course, score in scored if score >= min_score]
 
     # Sort descending by score; use public getter for stable tiebreak ordering.
-    scored.sort(key=lambda pair: (-pair[1], pair[0].get_name()))
+    scored.sort(key=lambda pair: (-pair[1], pair[0].get_course_code()))
 
     return scored[:top_n] if top_n is not None else scored
 
@@ -337,7 +371,7 @@ def explain_structured(course: "Course", preferences: dict) -> list[dict]:
     # --- Interest match ---
     interests = preferences.get("interests", [])
     if interests:
-        searchable = " ".join(course.tags + [course.description, course._name]).lower()
+        searchable = " ".join(course.tags + [course.description, course.get_name()]).lower()
         matched_interests = [
             i for i in interests
             if any(t in searchable for t in INTEREST_SYNONYMS.get(i.lower().strip(), []) + [i.lower().strip()])
@@ -410,7 +444,7 @@ def explain(course: "Course", preferences: dict) -> str:
     if interests:
         # Reuse the same expanded-term logic from _interest_score so the
         # explanation is always consistent with the actual score.
-        searchable = " ".join(course.tags + [course.description, course._name]).lower()
+        searchable = " ".join(course.tags + [course.description, course.get_name()]).lower()
         matched_interests = [
             i for i in interests
             if any(t in searchable for t in INTEREST_SYNONYMS.get(i.lower().strip(), []) + [i.lower().strip()])
@@ -421,68 +455,3 @@ def explain(course: "Course", preferences: dict) -> str:
             reasons.append("does not directly match your stated interests — consider as a breadth requirement")
 
     return ", ".join(reasons) if reasons else "No specific reasons found."
-
-
-courses = [
-    Course(
-        name="CSC108H1",
-        description="Introduction to Computer Science",
-        tags=["programming", "python", "computing", "problem-solving"],
-        prerequisites=[],
-        corequisites=[],
-        credits=0.5,
-        workload=3,
-        difficulty=5,
-        rating=None,
-        reviews=None,
-    ),
-    Course(
-        name="MAT137Y1",
-        description="Calculus with Proofs",
-        tags=["calculus", "proofs", "mathematics", "theory"],
-        prerequisites=[],
-        corequisites=[],
-        credits=1.0,
-        workload=4,
-        difficulty=7,
-        rating=None,
-        reviews=None,
-    ),
-    Course(
-        name="PSY100H1",
-        description="Introduction to Psychology",
-        tags=["psychology", "behavior", "social-science", "research"],
-        prerequisites=[],
-        corequisites=[],
-        credits=0.5,
-        workload=2,
-        difficulty=4,
-        rating=None,
-        reviews=None,
-    ),
-    Course(
-        name="MAT135H1",
-        description="Calculus I",
-        tags=["calculus", "algebra", "mathematics", "analysis"],
-        prerequisites=[],
-        corequisites=[],
-        credits=0.5,
-        workload=3,
-        difficulty=5,
-        rating=None,
-        reviews=None,
-    ),
-    Course(
-        name="MAT136H1",
-        description="Calculus II",
-        tags=["calculus", "integration", "mathematics", "applications"],
-        prerequisites=["MAT135H1"],
-        corequisites=[],
-        credits=0.5,
-        workload=3,
-        difficulty=6,
-        rating=None,
-        reviews=None,
-    ),
-]
-
