@@ -227,3 +227,6 @@ backend/courses_slim.json
 backend/data_pulling.py
 backend/practice.py
 backend/consolidate_courses.py
+backend/course_codes.json
+backend/course_embeddings.npy
+backend/build_embeddings.py

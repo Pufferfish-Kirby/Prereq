@@ -1,8 +1,13 @@
 # ok this is where we will define our scoring system
 import json
 import re
+from pathlib import Path
 
-with open("courses_slim.json", "r", encoding="utf-8") as file:  # since its utf-8 have to include the encoding
+# Use __file__ so this works regardless of which directory the process is launched from.
+# Without this, `open("courses_slim.json")` resolves against CWD, which breaks when
+# build_embeddings.py or tests are run from the project root instead of backend/.
+_DATA_FILE = Path(__file__).parent / "courses_slim.json"
+with open(_DATA_FILE, "r", encoding="utf-8") as file:
     data = json.load(file)
 
 class Course:
@@ -43,6 +48,13 @@ class Course:
         return self._credits
     def is_eligible(self, completed: list[str]) -> bool:
         return all(prereq in completed for prereq in self._prerequisites)
+
+    def to_text(self) -> str:
+        # Joins the most signal-rich fields into one string for embedding.
+        # Code first so the model sees the department prefix (MAT, CSC, etc.)
+        # before the name, giving code-prefix queries a strong anchor.
+        tags_str = " | ".join(self.tags) if self.tags else ""
+        return f"{self._code} {self._name}. {self.description} {tags_str}".strip()
 
 class AcademicHistory:  # this is here once we can link the history to get courses they can take/can't take
     courses: list[Course]
@@ -513,6 +525,32 @@ def _extract_interests_from_text(text: str) -> list[str]:
     return found
 
 
+# Matches UofT course codes with or without the suffix: MAT148, MAT148H1, CSC108H5S, ECO101Y1
+_COURSE_CODE_RE = re.compile(r'\b([A-Z]{2,4}\d{3}[HY]?\d?)\b', re.IGNORECASE)
+
+
+def _find_courses_by_code(message: str, course_list: list["Course"]) -> list[tuple["Course", float]]:
+    """
+    Direct course-code lookup before any interest scoring runs.
+
+    WHY this exists: interest extraction strips digits (re.findall(r"[a-z]+"...))
+    so "MAT148" becomes just "mat", which substring-matches hundreds of unrelated
+    courses ("cli-mat-e", "mat-hematics"). This step catches course-code patterns
+    first and pins matched courses at max score so they always appear in the top N.
+    """
+    found: list[tuple["Course", float]] = []
+    seen_codes: set[str] = set()
+    for m in _COURSE_CODE_RE.finditer(message):
+        query = m.group(1).upper()
+        for course in course_list:
+            code = course.get_course_code().upper()
+            # startswith so "MAT148" matches "MAT148H1", "MAT148H5", etc.
+            if code.startswith(query) and code not in seen_codes:
+                found.append((course, 10.0))
+                seen_codes.add(code)
+    return found
+
+
 def search_by_message(message: str, course_list: list["Course"], top_n: int = 5) -> list[tuple["Course", float]]:
     """
     Find the most interest-relevant courses for a free-text message.
@@ -528,6 +566,12 @@ def search_by_message(message: str, course_list: list["Course"], top_n: int = 5)
         injecting relevant courses into a Claude prompt), not the full ranked
         recommendation flow — that still goes through /recommend.
     """
+    # Direct code lookup runs first — if the user typed a course code like
+    # "MAT148" or "CSC108H1", surface those courses immediately at max score
+    # before the interest pipeline has a chance to bury them under false positives.
+    code_hits = _find_courses_by_code(message, course_list)
+    code_hit_codes = {c.get_course_code() for c, _ in code_hits}
+
     interests = _extract_interests_from_text(message)
 
     # Fallback: if no synonym-map terms matched, use the raw words from the
@@ -539,10 +583,13 @@ def search_by_message(message: str, course_list: list["Course"], top_n: int = 5)
     if not interests:
         interests = [w for w in re.findall(r"[a-z]+", message.lower()) if len(w) > 2]
 
-    if not interests:
-        return []
+    interest_scored: list[tuple["Course", float]] = []
+    if interests:
+        scored = [(course, _interest_score(course, interests)) for course in course_list]
+        # Exclude courses already surfaced by code lookup to avoid duplicates
+        interest_scored = [(c, s) for c, s in scored if s > 0 and c.get_course_code() not in code_hit_codes]
+        interest_scored.sort(key=lambda pair: (-pair[1], pair[0].get_course_code()))
 
-    scored = [(course, _interest_score(course, interests)) for course in course_list]
-    scored = [(c, s) for c, s in scored if s > 0]
-    scored.sort(key=lambda pair: (-pair[1], pair[0].get_course_code()))
-    return scored[:top_n] if top_n is not None else scored
+    # Code hits go first (pinned at 10.0), then interest-ranked courses fill remaining slots
+    combined = code_hits + interest_scored
+    return combined[:top_n] if top_n is not None else combined
