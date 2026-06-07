@@ -9,7 +9,10 @@ why some queries miss relevant courses. Includes:
   - Course detail printing
 """
 
-from scoring import search_by_message, courses, _extract_interests_from_text, _strip_filler
+from scoring import (
+    search_by_message, courses, _extract_interests_from_text, _strip_filler,
+    _detect_year_level, _strip_year_phrases, _expand_query,
+)
 from embeddings import semantic_search
 
 
@@ -159,47 +162,76 @@ def dump_all_coding_courses() -> None:
     return coding_courses
 
 
-PROBLEM_QUERIES = [
-    "coding courses for first year students",
-    "Do you have any coding courses to recommend to a first year",
+def test_full_pipeline(message: str, top_n: int = 5) -> None:
+    """
+    Show every intermediate transformation in the retrieval pipeline, then the results.
+
+    WHY this transparency matters:
+        Each step — year detection, stop-word stripping, year-phrase stripping,
+        query expansion — changes what the embedding model sees. When results are
+        surprising, printing the intermediate state immediately shows which step
+        is responsible without needing a debugger. A developer can see:
+
+          Step 1: what year (if any) was captured and filtered on
+          Step 2: what tokens survived stop-word stripping
+          Step 3: whether the year phrase was successfully erased
+          Step 4: what the embedding model actually receives
+
+        Without this function, you'd have to add print statements inside scoring.py
+        and re-run — this surfaces the whole chain in one call.
+    """
+    print(f"\n{'='*80}")
+    print(f"PIPELINE TEST: \"{message}\"")
+    print(f"{'='*80}")
+
+    # Step 1: year detection (must run on raw message, before any stripping)
+    year = _detect_year_level(message)
+    print(f"\n  1. Detected year level   : {year if year is not None else '(none — no year filter applied)'}")
+
+    # Step 2: stop-word stripping
+    stripped = _strip_filler(message)
+    print(f"  2. After stop-word strip : {repr(stripped)}")
+
+    # Step 3: year-phrase stripping (only meaningful when a year was detected)
+    if year is not None:
+        after_year_strip = _strip_year_phrases(stripped)
+        print(f"  3. After year-phrase strip: {repr(after_year_strip)}")
+    else:
+        after_year_strip = stripped
+        print(f"  3. Year-phrase strip     : (skipped — no year detected)")
+
+    # Step 4: query expansion
+    expanded = _expand_query(after_year_strip)
+    if expanded != after_year_strip:
+        print(f"  4. After expansion       : {repr(expanded)}")
+    else:
+        print(f"  4. After expansion       : (no expansions triggered)")
+
+    # Final results via the full pipeline
+    results = search_by_message(message, courses, top_n=top_n)
+    print(f"\n  Results (top {top_n}):")
+    print(f"  {'Score':<8} {'Code':<14} Course Name")
+    print(f"  {'-'*65}")
+    if not results:
+        print("  (no results)")
+    else:
+        for course, score in results:
+            name = course.get_name()[:45]
+            print(f"  {score:6.3f}   {course.get_course_code():<14} {name}")
+
+
+PIPELINE_QUERIES = [
+    "coding courses first year",
+    "introductory programming",
+    "second year ML courses",
+    "first year math",
 ]
 
 
 if __name__ == "__main__":
     print("\n" + "="*80)
-    print("RETRIEVAL TEST SUITE — WITH STOP WORD STRIPPING")
+    print("FULL PIPELINE TESTS — YEAR FILTERING + QUERY EXPANSION")
     print("="*80)
 
-    # 1. Show what the stop word stripper does to each problem query
-    print("\n--- STOP WORD STRIPPING PREVIEW ---")
-    for q in PROBLEM_QUERIES:
-        stripped = _strip_filler(q)
-        print(f"  Original : {q}")
-        print(f"  Stripped : {stripped}")
-        print()
-
-    # 2. For each problem query: raw message search (now uses stripped query internally)
-    print("\n--- MESSAGE SEARCH (stop-word-stripped internally) ---")
-    for q in PROBLEM_QUERIES:
-        test_message_search(q, top_n=10)
-
-    # 3. Also test the stripped queries directly against semantic_search so we can
-    #    see the raw similarity scores without the scoring.py wrapper
-    print("\n--- DIRECT SEMANTIC SEARCH ON STRIPPED QUERIES ---")
-    for q in PROBLEM_QUERIES:
-        stripped = _strip_filler(q)
-        test_semantic_search(stripped, top_n=10)
-
-    # 4. Baseline: "introductory programming" should still work as before
-    print("\n--- BASELINE (should still work) ---")
-    test_semantic_search("introductory programming", top_n=10)
-
-    # 5. Reference list of all coding courses in the DB
-    all_coding = dump_all_coding_courses()
-
-    print(f"\n{'='*80}")
-    print(f"SUMMARY")
-    print(f"{'='*80}")
-    print(f"Total courses in database: {len(courses)}")
-    print(f"Courses with 'coding'/'programming' in text: {len(all_coding)}")
-    print(f"Embedding model: all-MiniLM-L6-v2 (384-dim)")
+    for q in PIPELINE_QUERIES:
+        test_full_pipeline(q, top_n=5)

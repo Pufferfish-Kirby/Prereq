@@ -626,6 +626,161 @@ def _strip_filler(text: str) -> str:
     return " ".join(meaningful) if meaningful else text
 
 
+# ── Query expansion ──────────────────────────────────────────────────────────
+# Maps a single student-vocabulary token to a replacement string that includes
+# the original token plus its canonical equivalent. Applied AFTER stop-word
+# stripping so only content tokens are expanded.
+#
+# WHY keep this dict small and explicit rather than reusing INTEREST_SYNONYMS:
+#     INTEREST_SYNONYMS drives the /recommend scoring path and contains many
+#     synonyms per key. Here we only want to fix known embedding blind spots
+#     (e.g. "coding" ≈ "programming" in student speech but the model doesn't
+#     always bridge them). Adding entries speculatively risks over-broadening
+#     the query and hurting precision. Only add when a real query is observed
+#     missing courses it should find.
+_QUERY_EXPANSIONS: dict[str, str] = {
+    "coding": "coding programming",
+}
+
+
+def _expand_query(text: str) -> str:
+    """
+    Replace known shorthand tokens with an expanded form that includes both
+    the original token and its canonical synonym.
+
+    WHY token-by-token replacement rather than substring:
+        Substring replacement on "coding" inside "decoding" would corrupt the
+        word. Splitting on whitespace first ensures only whole-word tokens match,
+        which is correct because stop-word stripping already normalises to a
+        space-separated token stream.
+
+    WHY the expansion keeps the original token ("coding programming" not just
+    "programming"):
+        The expanded string contributes to the embedding vector. Dropping the
+        original token would lose any unique signal it carries; including both
+        lets the model see both vocabularies simultaneously.
+    """
+    tokens = text.split()
+    return " ".join(_QUERY_EXPANSIONS.get(t, t) for t in tokens)
+
+
+# ── Year-level detection and filtering ───────────────────────────────────────
+# UofT course codes encode the year level in the first digit of the 3-digit
+# number: CSC108H1 → year 1, MAT207H1 → year 2, CSC309H1 → year 3, etc.
+# These helpers extract that signal from both the user's query and course codes
+# so we can restrict semantic search to the relevant year pool before embedding.
+
+# Each tuple is (regex_pattern, year_integer). Patterns use word boundaries and
+# optional hyphen/space between the ordinal and "year" to catch "first-year",
+# "first year", and "1st year" variants. re.IGNORECASE is applied at call time.
+_YEAR_PATTERNS: list[tuple[str, int]] = [
+    (r"\bfirst[\s\-]?year\b",  1),
+    (r"\b1st[\s\-]?year\b",    1),
+    (r"\byear[\s\-]?1\b",      1),
+    # "introductory" is treated as year-1 because all intro-level courses at UofT
+    # are coded 1xx. This is a soft heuristic — if it causes false positives for
+    # upper-year intro topics, add a subject-qualifier guard here.
+    (r"\bintroductory\b",      1),
+    (r"\bsecond[\s\-]?year\b", 2),
+    (r"\b2nd[\s\-]?year\b",    2),
+    (r"\byear[\s\-]?2\b",      2),
+    (r"\bthird[\s\-]?year\b",  3),
+    (r"\b3rd[\s\-]?year\b",    3),
+    (r"\byear[\s\-]?3\b",      3),
+    (r"\bfourth[\s\-]?year\b", 4),
+    (r"\b4th[\s\-]?year\b",    4),
+    (r"\byear[\s\-]?4\b",      4),
+]
+
+
+def _detect_year_level(text: str) -> int | None:
+    """
+    Scan text for year-level phrases and return the corresponding year (1–4),
+    or None if no year phrase is found.
+
+    WHY run on the raw (un-stripped) message:
+        _strip_filler does not remove "first", "second", or "introductory" (none
+        are in _STOP_WORDS), so detection would work either way. Running on the
+        raw message is still the safer policy: if _STOP_WORDS ever grows to
+        include those words, detection would silently break if we ran it post-strip.
+
+    WHY first-match wins:
+        Users almost never state contradictory years ("first year third year") in
+        a single query. First-match is deterministic, predictable, and easy to
+        debug — majority-vote would add complexity with no real benefit here.
+    """
+    for pattern, year in _YEAR_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return year
+    return None
+
+
+def _get_course_year(code: str) -> int | None:
+    """
+    Extract the year level (1–4) from a UofT course code.
+
+    UofT convention: the first digit of the 3-digit number encodes the year.
+        CSC108H1  → year 1  (the '1' in '108')
+        MAT207H1  → year 2  (the '2' in '207')
+        CSC309H1  → year 3
+        CSC404H1  → year 4
+        CSC099Y1  → year 0  (special/pre-credit; returns None)
+
+    WHY return None for year-0 codes rather than 0:
+        None cleanly signals "unknown or ineligible". Callers can use
+        `_get_course_year(code) == year` as a filter predicate without needing
+        to special-case 0 separately. Year-0 specials like CSC099Y1 are
+        precisely the false-positives we want to exclude from year filters.
+    """
+    m = re.search(r"[A-Za-z]{2,4}(\d)\d{2}", code)
+    if m:
+        yr = int(m.group(1))
+        return yr if yr in (1, 2, 3, 4) else None
+    return None
+
+
+def _filter_by_year(course_list: list["Course"], year: int) -> list["Course"]:
+    """
+    Return only the courses whose code encodes the requested year level.
+
+    WHY return a new list instead of mutating:
+        course_list is the global catalog passed in by the caller. Mutating it
+        would corrupt all subsequent calls for the lifetime of the process.
+    """
+    return [c for c in course_list if _get_course_year(c.get_course_code()) == year]
+
+
+def _strip_year_phrases(text: str) -> str:
+    """
+    Remove year-level phrases from an already-stop-word-stripped query.
+
+    Called AFTER _detect_year_level has already captured the year as an integer,
+    so the year signal is not lost — only its textual form is erased from the
+    query that gets embedded.
+
+    WHY this is separate from _strip_filler:
+        _strip_filler is a token-level stop-word remover. "first year" is a
+        two-word phrase that token stripping can't remove atomically — stripping
+        "first" alone would leave "year" behind, and "year" alone in the query
+        would still pull the embedding toward courses with "year" in their text.
+        Regex-based phrase removal handles multi-word patterns cleanly.
+
+    WHY strip after detection, not before:
+        We need the matched year integer before we remove the phrase. If we
+        stripped first, _detect_year_level would have nothing to match against.
+
+    Example:
+        "coding courses first year"   → "coding courses"
+        "introductory programming"    → "programming"
+        "second year machine learning"→ "machine learning"
+    """
+    result = text
+    for pattern, _ in _YEAR_PATTERNS:
+        result = re.sub(pattern, "", result, flags=re.IGNORECASE)
+    # Collapse any double spaces left by removed phrases
+    return re.sub(r"\s+", " ", result).strip()
+
+
 def _find_courses_by_code(message: str, course_list: list["Course"]) -> list[tuple["Course", float]]:
     """
     Direct course-code lookup before any interest scoring runs.
@@ -652,45 +807,81 @@ def search_by_message(message: str, course_list: list["Course"], top_n: int = 5)
     """
     Find the most relevant courses for a free-text message.
 
-    Two-pass retrieval:
-      1. Course-code detection — if the message contains a UofT code pattern
-         (e.g. "MAT148", "CSC108H1") those courses are pinned at the top with
-         a score of 10.0. This is exact-match, always wins over semantic.
-      2. Semantic search — encode the query and rank all remaining courses by
-         cosine similarity against the pre-built embedding index. This handles
-         natural language like "proof-based math course" or "machine learning
-         for non-CS students" that keyword matching would miss or mangle.
+    Six-step pipeline:
+      1. Exact course-code detection — pins matched courses at score 10.0.
+         Always wins over semantic; handles "tell me about CSC108H1" queries.
+      2. Year-level detection — scans the raw message for phrases like "first
+         year", "introductory", "2nd year". When found, the candidate pool is
+         restricted to courses whose code digit matches that year.
+      3. Stop-word stripping — removes conversational filler so the embedding
+         query reflects topic intent, not phrasing style.
+      4. Year-phrase stripping — removes the now-consumed year signal from the
+         query string. Without this step, "first year" would remain and pull the
+         embedding toward courses that *mention* "first year" in their text
+         (e.g. CSC099Y1 "First-Year Learning Community") rather than courses
+         *coded at* year 1 (CSC1xx).
+      5. Query expansion — broadens sparse terms to include canonical synonyms
+         (e.g. "coding" → "coding programming") so vocabulary mismatches between
+         student language and course catalog language are bridged.
+      6. Semantic search with year mask — cosine similarity over the embedding
+         index, optionally restricted to the year-filtered candidate pool via
+         a numpy boolean mask.
 
-    WHY replace keyword scoring here:
-        _interest_score() was designed for the /recommend flow where the student
-        explicitly states interests. For freeform chat messages it degrades badly
-        because (a) digits are stripped so "MAT148" → "mat" → 100+ false matches,
-        and (b) the synonym map can't cover every subject a student might mention.
-        Semantic similarity handles both cases without a manually curated map.
+    WHY year filtering happens before embedding (not after):
+        The embedding index has N≈3206 rows. Without pre-filtering, the top-N
+        selection could be dominated by courses from the wrong year that happen
+        to have high semantic similarity. With the mask, argsort only considers
+        year-matched rows so the final top_n results are guaranteed to come from
+        the correct year pool — no silent under-delivery.
 
-    Note: _extract_interests_from_text(), _interest_score(), and INTEREST_SYNONYMS
-    are still used by score_course() / explain() for the /recommend endpoint.
-    Only this function is switching to semantic retrieval.
+    WHY _extract_interests_from_text() and INTEREST_SYNONYMS are not used here:
+        Those were designed for the /recommend flow where the student explicitly
+        declares interests. For freeform chat this function uses embedding
+        similarity instead, which handles arbitrary natural language without a
+        manually curated synonym map.
     """
     from embeddings import semantic_search  # local import avoids circular dependency at module load
 
-    # Pass 1: exact course-code lookup — highest priority, no semantic needed
+    # Step 1: exact course-code lookup — highest priority, no semantic needed
     code_hits = _find_courses_by_code(message, course_list)
     code_hit_codes = {c.get_course_code() for c, _ in code_hits}
 
-    # Pass 2: semantic search fills the remaining slots
     remaining = top_n - len(code_hits)
     semantic_hits: list[tuple["Course", float]] = []
+
     if remaining > 0:
-        # Strip conversational filler before embedding so the query vector reflects
-        # topic intent rather than phrasing. "Do you have any coding courses to
-        # recommend to a first year" → "coding courses first year".
+        # Step 2: year detection — must run on the raw message before any
+        # stripping, so the year phrase is still present to match against.
+        year = _detect_year_level(message)
+
+        # Build the allowed_codes set for the embedding mask.
+        # None means "no mask" — score all rows — when no year was detected.
+        allowed_codes: set[str] | None = (
+            {c.get_course_code() for c in _filter_by_year(course_list, year)}
+            if year is not None else None
+        )
+
+        # Step 3: strip conversational filler
         semantic_query = _strip_filler(message)
 
-        # O(1) code → Course lookup so we can resolve codes returned by semantic_search()
+        # Step 4: strip the year phrase that was already captured as a filter.
+        # Leaving it in would attract courses that *mention* "first year" rather
+        # than courses *at* year 1, which the mask already guarantees.
+        if year is not None:
+            semantic_query = _strip_year_phrases(semantic_query)
+
+        # Step 5: expand shorthand terms to include canonical synonyms
+        semantic_query = _expand_query(semantic_query)
+
+        # Step 6: semantic search with optional year mask
+        # O(1) code → Course lookup to resolve codes returned by semantic_search()
         code_to_course = {c.get_course_code(): c for c in course_list}
-        # Request more than we need so we have enough candidates after filtering
-        for code, score in semantic_search(semantic_query, top_n=top_n + len(code_hits)):
+        # Request more than top_n to have enough candidates after excluding code_hits
+        for code, score in semantic_search(
+            semantic_query,
+            top_n=top_n + len(code_hits),
+            allowed_codes=allowed_codes,
+        ):
             if code not in code_hit_codes and code in code_to_course:
                 semantic_hits.append((code_to_course[code], score))
                 if len(semantic_hits) >= remaining:
