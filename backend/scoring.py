@@ -640,6 +640,10 @@ def _strip_filler(text: str) -> str:
 #     missing courses it should find.
 _QUERY_EXPANSIONS: dict[str, str] = {
     "coding": "coding programming",
+    "ml":     "ml machine learning",
+    "ai":     "ai artificial intelligence",
+    "cs":     "cs computer science",
+    "stats":  "stats statistics",
 }
 
 
