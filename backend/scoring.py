@@ -228,7 +228,7 @@ def _rating_score(rating: float | None) -> float:
     return ((raw - RATING_MIN) / (RATING_MAX - RATING_MIN)) * 10.0
 
 
-def score_course(course: "Course", preferences: dict) -> float:
+def score_course(course: "Course", preferences: dict, interest_score: float | None = None) -> float:
     """
     Score a course from 0.0 to 10.0 (1 decimal place) based on how well
     it matches the student's preferences.
@@ -240,11 +240,13 @@ def score_course(course: "Course", preferences: dict) -> float:
     Weights:
         difficulty  22.5%  — proximity to preferred difficulty
         workload    22.5%  — proximity to preferred workload
-        rating      20%  — normalized course rating (higher is always better)
-        interest    35%  — how well the course matches the student's interests
+        rating      20%    — normalized course rating (higher is always better)
+        interest    35%    — how well the course matches the student's interests
 
-    Future signals (not yet implemented) will slot in here once we have
-    interest vectors and program-fit data, and weights will be adjusted.
+    The optional `interest_score` parameter lets callers inject a pre-computed
+    value (e.g. a normalised semantic similarity score from recommend_courses).
+    When omitted, the keyword-based _interest_score() is used as a fallback so
+    this function remains usable without a pre-built embedding index.
     """
     preferred_difficulty = preferences.get("preferred_difficulty", 5)
     preferred_workload   = preferences.get("preferred_workload", 3)
@@ -252,7 +254,9 @@ def score_course(course: "Course", preferences: dict) -> float:
     diff_score   = _proximity_score(course.difficulty, preferred_difficulty, DIFFICULTY_MIN, DIFFICULTY_MAX)
     work_score   = _proximity_score(course.workload,   preferred_workload,   WORKLOAD_MIN,   WORKLOAD_MAX)
     rating_score = _rating_score(course.rating)
-    interest_score = _interest_score(course, preferences.get("interests", []))
+
+    if interest_score is None:
+        interest_score = _interest_score(course, preferences.get("interests", []))
 
     raw = (
         WEIGHT_DIFFICULTY * diff_score +
@@ -267,36 +271,82 @@ def score_course(course: "Course", preferences: dict) -> float:
 
 def recommend_courses(course_list: list["Course"], preferences: dict, top_n: int = 5) -> list[tuple["Course", float]]:
     """
-    Return courses sorted by their score (highest first).
+    Return the top courses sorted by score (highest first).
 
-    Each item in the returned list is a (course, score) tuple so the caller
-    can display the score alongside the name without re-computing it.
+    Uses a two-phase approach:
+      1. Semantic pre-filter — for each interest, call semantic_search() to
+         get the top 50 embedding-nearest courses. Take the union across all
+         interests, keeping the best similarity score per course. This limits
+         scoring to the ~50-150 most conceptually relevant candidates instead
+         of the entire 3000-course catalog, which prevents keyword false-positives
+         (e.g. a history-of-computing course scoring the same as CSC108 because
+         both mention the word "computing").
+      2. Full scoring — run score_course() on each candidate, injecting the
+         normalised semantic similarity as the interest score component. The
+         similarity is normalised relative to the top match so the best
+         candidate always receives 10/10 and others scale down proportionally.
+
+    WHY normalise relative to the top match rather than using raw cosine similarity:
+        Raw cosine values vary by query ("coding" might have a max sim of 0.65
+        while "machine learning" peaks at 0.82). Normalising removes this
+        query-to-query variance so the interest weight (35%) is consistent
+        regardless of how well the embedding space separates a particular topic.
 
     Args:
-        course_list:  the pool of courses to rank (e.g. all courses in the DB)
+        course_list:  the pool of courses to rank (all courses in the DB)
         preferences:  same dict passed to score_course
-        top_n:        if given, only return the top N results; otherwise return all
-
-    This is intentionally a thin wrapper around score_course — the real
-    intelligence lives there. As we add more signals (interest match, major fit)
-    this function stays the same; only score_course changes.
+        top_n:        cap on returned results; None returns all passing min_score
     """
-    eligible = [
-        c for c in course_list
-        if c.is_eligible(preferences.get("completed_courses", []))
+    from embeddings import semantic_search  # local import avoids circular dep at module load
+
+    interests = preferences.get("interests", [])
+    completed = preferences.get("completed_courses", [])
+
+    if interests:
+        # Query the embedding index once per interest and union the results.
+        # top_n=50 per interest gives ample candidate coverage without scoring
+        # the full catalog. Courses that match multiple interests keep the best sim.
+        code_to_sim: dict[str, float] = {}
+        for interest in interests:
+            for code, sim in semantic_search(interest, top_n=50):
+                code_to_sim[code] = max(code_to_sim.get(code, 0.0), sim)
+
+        # Normalise to [0, 10] so the top semantic match always scores 10/10.
+        max_sim = max(code_to_sim.values()) if code_to_sim else 1.0
+
+        code_to_course = {c.get_course_code(): c for c in course_list}
+        candidates: list[tuple["Course", float]] = [
+            (code_to_course[code], min(10.0, (sim / max_sim) * 10.0))
+            for code, sim in code_to_sim.items()
+            if code in code_to_course
+        ]
+
+        eligible = [
+            (course, interest_score)
+            for course, interest_score in candidates
+            if course.is_eligible(completed)
+        ]
+    else:
+        # No interests provided — fall back to full catalog with interest score = 0.
+        # Courses are ranked purely by difficulty/workload/rating proximity.
+        eligible = [
+            (course, 0.0)
+            for course in course_list
+            if course.is_eligible(completed)
+        ]
+
+    scored = [
+        (course, score_course(course, preferences, interest_score))
+        for course, interest_score in eligible
     ]
-    scored = [(course, score_course(course, preferences)) for course in eligible]
 
-    # Filter out weak matches — showing a course with a score below 5 implies
-    # it's at least somewhat relevant, which is misleading to the student.
-    # If this filter removes everything (e.g. very niche input), the frontend
-    # should show a "no strong matches" message rather than low-scoring filler.
+    # Filter out weak matches — a score below 5 implies marginal relevance,
+    # which is misleading. If this removes everything, the frontend should show
+    # a "no strong matches" message rather than showing low-scoring filler.
     min_score = preferences.get("min_score", 5.0)
-    scored = [(course, score) for course, score in scored if score >= min_score]
+    scored = [(c, s) for c, s in scored if s >= min_score]
 
-    # Sort descending by score; use public getter for stable tiebreak ordering.
     scored.sort(key=lambda pair: (-pair[1], pair[0].get_course_code()))
-
     return scored[:top_n] if top_n is not None else scored
 
 
@@ -528,6 +578,53 @@ def _extract_interests_from_text(text: str) -> list[str]:
 # Matches UofT course codes with or without the suffix: MAT148, MAT148H1, CSC108H5S, ECO101Y1
 _COURSE_CODE_RE = re.compile(r'\b([A-Z]{2,4}\d{3}[HY]?\d?)\b', re.IGNORECASE)
 
+# Words that carry no semantic signal for course retrieval. Stripping these before
+# embedding prevents conversational phrasing ("Do you have any coding courses to
+# recommend to a first year") from pulling the query vector toward generic filler
+# and away from the meaningful terms ("coding", "first year").
+# WHY a frozenset: O(1) membership test; we check every token so speed matters.
+_STOP_WORDS: frozenset[str] = frozenset({
+    # question/conversational openers
+    "do", "does", "did", "can", "could", "would", "should", "will", "shall",
+    "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had",
+    # pronouns
+    "i", "me", "my", "we", "you", "your", "it", "its",
+    # articles / determiners
+    "a", "an", "the", "any", "some", "no", "all",
+    # prepositions / conjunctions
+    "to", "for", "of", "in", "on", "at", "by", "from", "with", "about",
+    "and", "or", "but", "so", "if", "as",
+    # filler verbs & adverbs in course queries
+    "want", "need", "like", "know", "think", "tell", "show", "give",
+    "recommend", "suggest", "find", "get", "take",
+    "please", "just", "really", "very", "more", "also",
+    # question words (after stripping these the nouns/topics remain)
+    "what", "which", "who", "where", "when", "how", "why",
+    # other high-frequency noise
+    "there", "here", "this", "that", "these", "those",
+    "up", "out", "into", "than", "then", "now",
+})
+
+
+def _strip_filler(text: str) -> str:
+    """
+    Remove stop words from a free-text query before embedding.
+
+    Keeps only tokens that carry subject-matter signal so the embedding
+    vector reflects the student's actual topic intent rather than conversational
+    framing. Preserves the relative order of meaningful tokens.
+
+    Example:
+        "Do you have any coding courses to recommend to a first year"
+        → "coding courses first year"
+    """
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    meaningful = [t for t in tokens if t not in _STOP_WORDS]
+    # Fall back to the original text if stripping removes everything
+    # (e.g. a one-word stop word query — rare but safe to handle).
+    return " ".join(meaningful) if meaningful else text
+
 
 def _find_courses_by_code(message: str, course_list: list["Course"]) -> list[tuple["Course", float]]:
     """
@@ -553,43 +650,50 @@ def _find_courses_by_code(message: str, course_list: list["Course"]) -> list[tup
 
 def search_by_message(message: str, course_list: list["Course"], top_n: int = 5) -> list[tuple["Course", float]]:
     """
-    Find the most interest-relevant courses for a free-text message.
+    Find the most relevant courses for a free-text message.
 
-    Extracts known interest terms from the message, scores every course by
-    interest only (difficulty/workload/rating are skipped — those require
-    per-course data we don't have yet), then returns the top N with score > 0.
+    Two-pass retrieval:
+      1. Course-code detection — if the message contains a UofT code pattern
+         (e.g. "MAT148", "CSC108H1") those courses are pinned at the top with
+         a score of 10.0. This is exact-match, always wins over semantic.
+      2. Semantic search — encode the query and rank all remaining courses by
+         cosine similarity against the pre-built embedding index. This handles
+         natural language like "proof-based math course" or "machine learning
+         for non-CS students" that keyword matching would miss or mangle.
 
-    WHY interest-only scoring here vs. score_course():
-        score_course() needs preferred_difficulty and preferred_workload from
-        the student's profile. A raw chat message has neither, so we only use
-        the interest signal. This is meant for quick contextual lookup (e.g.
-        injecting relevant courses into a Claude prompt), not the full ranked
-        recommendation flow — that still goes through /recommend.
+    WHY replace keyword scoring here:
+        _interest_score() was designed for the /recommend flow where the student
+        explicitly states interests. For freeform chat messages it degrades badly
+        because (a) digits are stripped so "MAT148" → "mat" → 100+ false matches,
+        and (b) the synonym map can't cover every subject a student might mention.
+        Semantic similarity handles both cases without a manually curated map.
+
+    Note: _extract_interests_from_text(), _interest_score(), and INTEREST_SYNONYMS
+    are still used by score_course() / explain() for the /recommend endpoint.
+    Only this function is switching to semantic retrieval.
     """
-    # Direct code lookup runs first — if the user typed a course code like
-    # "MAT148" or "CSC108H1", surface those courses immediately at max score
-    # before the interest pipeline has a chance to bury them under false positives.
+    from embeddings import semantic_search  # local import avoids circular dependency at module load
+
+    # Pass 1: exact course-code lookup — highest priority, no semantic needed
     code_hits = _find_courses_by_code(message, course_list)
     code_hit_codes = {c.get_course_code() for c, _ in code_hits}
 
-    interests = _extract_interests_from_text(message)
+    # Pass 2: semantic search fills the remaining slots
+    remaining = top_n - len(code_hits)
+    semantic_hits: list[tuple["Course", float]] = []
+    if remaining > 0:
+        # Strip conversational filler before embedding so the query vector reflects
+        # topic intent rather than phrasing. "Do you have any coding courses to
+        # recommend to a first year" → "coding courses first year".
+        semantic_query = _strip_filler(message)
 
-    # Fallback: if no synonym-map terms matched, use the raw words from the
-    # message directly as search terms. This handles specific proper nouns and
-    # subject words ("shakespeare", "ethics", "stoicism") that will never be
-    # in the synonym map but DO appear in course titles and descriptions.
-    # WHY filter len > 2: drops articles/prepositions ("a", "in", "to") that
-    # would match too broadly and add noise rather than signal.
-    if not interests:
-        interests = [w for w in re.findall(r"[a-z]+", message.lower()) if len(w) > 2]
+        # O(1) code → Course lookup so we can resolve codes returned by semantic_search()
+        code_to_course = {c.get_course_code(): c for c in course_list}
+        # Request more than we need so we have enough candidates after filtering
+        for code, score in semantic_search(semantic_query, top_n=top_n + len(code_hits)):
+            if code not in code_hit_codes and code in code_to_course:
+                semantic_hits.append((code_to_course[code], score))
+                if len(semantic_hits) >= remaining:
+                    break
 
-    interest_scored: list[tuple["Course", float]] = []
-    if interests:
-        scored = [(course, _interest_score(course, interests)) for course in course_list]
-        # Exclude courses already surfaced by code lookup to avoid duplicates
-        interest_scored = [(c, s) for c, s in scored if s > 0 and c.get_course_code() not in code_hit_codes]
-        interest_scored.sort(key=lambda pair: (-pair[1], pair[0].get_course_code()))
-
-    # Code hits go first (pinned at 10.0), then interest-ranked courses fill remaining slots
-    combined = code_hits + interest_scored
-    return combined[:top_n] if top_n is not None else combined
+    return code_hits + semantic_hits
