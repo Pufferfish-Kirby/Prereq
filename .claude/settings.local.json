@@ -6,5 +6,8 @@
       "WebFetch(domain:www.oxdia.com)",
       "WebFetch(domain:thevarsity.ca)"
     ]
+  },
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   }
 }
