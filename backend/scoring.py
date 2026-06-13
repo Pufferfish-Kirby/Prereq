@@ -6,7 +6,7 @@ from pathlib import Path
 # Use __file__ so this works regardless of which directory the process is launched from.
 # Without this, `open("courses_slim.json")` resolves against CWD, which breaks when
 # build_embeddings.py or tests are run from the project root instead of backend/.
-_DATA_FILE = Path(__file__).parent / "courses_slim.json"
+_DATA_FILE = Path(__file__).parent / "courses_all_enriched.json"  # enriched file adds AI-generated difficulty/workload per course
 with open(_DATA_FILE, "r", encoding="utf-8") as file:
     data = json.load(file)
 
@@ -141,6 +141,8 @@ for c in data:
         prerequisites=c['prerequisites'],
         corequisites=c['corequisites'],
         credits=c['credit_value'],
+        difficulty=c.get("difficulty") or 5,  # AI-scored 1–10; fallback to 5 if null/missing/0
+        workload=c.get("workload") or 5,       # AI-scored 1–10; fallback to 5 if null/missing/0
     ))
 
 def _interest_score(course: "Course", interests: list[str]) -> float:

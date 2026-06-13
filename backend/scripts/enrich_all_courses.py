@@ -15,6 +15,17 @@ Three deliberate changes from the original:
   3. Workload scale is 1–10 (not 1–5), giving finer resolution to distinguish
      e.g. a light 3-hr/week course from a moderate 5-hr/week one.
 
+WHY the Batches API instead of synchronous calls:
+  The previous version called client.messages.create() once per course in a
+  blocking loop — each call waited for a response before moving to the next.
+  For thousands of courses this was slow and accumulated rate-limit pressure.
+  The Batches API instead accepts up to 100,000 requests in a single call,
+  processes them all asynchronously (up to 24-hour turnaround), and returns
+  results when done. Key practical benefit: 50% token cost reduction on every
+  input and output token, plus no per-request latency stacking or rate-limit
+  throttling mid-run. The tradeoff is that results aren't available immediately
+  — the script polls for completion rather than processing courses one by one.
+
 Run from the backend/ directory:
     python scripts/enrich_all_courses.py
 
@@ -25,9 +36,12 @@ the repo and does NOT overwrite the CS-sample file from enrich_courses.py.
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import anthropic
+from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+from anthropic.types.messages.batch_create_params import Request
 from dotenv import load_dotenv
 
 # Walk up from the script to find the .env file — dotenv searches parent
@@ -79,21 +93,14 @@ def course_prefix(code: str) -> str:
     return match.group(1).upper() if match else ""
 
 
-def estimate_scores(
-    client: anthropic.Anthropic,
-    course: dict,
-) -> dict[str, int | str | None]:
+def build_prompt(course: dict) -> str:
     """
-    Ask Claude Haiku to score a course on difficulty and weekly workload.
+    Build the scoring prompt for a single course.
 
-    WHY ask for JSON directly (not wrapped in markdown): we parse
-    programmatically; asking for bare JSON is simpler than stripping fences,
-    and Haiku reliably follows this instruction when told explicitly.
-
-    WHY include prerequisites in the prompt: a course titled "Advanced
-    Topics in X" has very different difficulty if its prereq is one intro
-    course vs. several upper-year courses — the prereq chain is often the
-    strongest difficulty signal available.
+    WHY extracted as its own function: the Batches API requires constructing all
+    requests before submitting any of them, so prompt-building must be separable
+    from the API call itself. In the old synchronous version these were fused
+    inside estimate_scores().
     """
     code = course.get("code", "")
     name = course.get("name", "")
@@ -107,7 +114,7 @@ def estimate_scores(
     # to a CS student but genuinely challenging to someone encountering academic
     # argument and close reading for the first time. An undeclared-major student
     # is the most neutral baseline that applies fairly across every department.
-    prompt = f"""You are estimating difficulty and weekly workload for a University of Toronto course planner.
+    return f"""You are estimating difficulty and weekly workload for a University of Toronto course planner.
 
 Calibrate every score from the perspective of an AVERAGE UofT undeclared-major student — someone who:
 - Has NOT declared a major and is still exploring what subjects interest them
@@ -120,6 +127,7 @@ Calibrate every score from the perspective of an AVERAGE UofT undeclared-major s
 
 Do NOT calibrate for the star student who breezes through everything, or the struggling student who finds every course hard. Aim for the middle of the bell curve.
 Calibrate difficulty especially from the lens of someone encountering this subject for the first time, with no specialist context.
+If your reasoning contains a semicolon, rewrite it without one before returning.
 
 Course: {code} — {name}
 Description: {description if description else "(no description available)"}
@@ -155,16 +163,19 @@ Calibration anchors for workload:
     spends 10–12 hrs/week between debugging, derivations, and write-ups          → 7
   A 400-level seminar with weekly response papers and a major research essay→ 8
   A capstone or intensive lab course requiring sustained full-semester output→ 9
-Use these anchors to sanity-check your estimate. Err toward the lower end of each band when uncertain — it is better to underestimate slightly than to inflate scores."""
+Use these anchors to sanity-check your estimate. Err toward the lower end of each band when uncertain — it is better to underestimate slightly than to inflate scores.
 
-    response = client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}],
-    )
+Remember the reason IS NO MORE THAN 20 WORDS."""
 
-    raw = response.content[0].text.strip()
 
+def parse_scores(raw: str) -> dict[str, int | str | None]:
+    """
+    Parse Claude's JSON response into structured difficulty/workload scores.
+
+    WHY a standalone function: both the batch result loop and any future
+    debugging path need the same fence-stripping and error-fallback logic.
+    Extracting it prevents duplication.
+    """
     # Strip markdown fences defensively — Haiku sometimes adds them anyway
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\n?", "", raw)
@@ -202,8 +213,8 @@ def main() -> None:
     # ── SAMPLE MODE (optional) ────────────────────────────────────────────────
     # Set SAMPLE_MODE = True to score one random course per department (max 10)
     # instead of the full catalog — useful for prompt tuning without full API cost.
-    SAMPLE_MODE = True
-    STEM_ONLY_SAMPLE = True
+    SAMPLE_MODE = False
+    STEM_ONLY_SAMPLE = False
     STEM_PREFIXES = {
         "CSC", "MAT", "STA", "PHY", "CHM", "BIO", "BCH", "EEB", "PSY",
         "ENV", "ESS", "AST", "ECE", "MSE", "CHE", "MIE", "CIV", "BME",
@@ -234,29 +245,99 @@ def main() -> None:
         all_courses = sampled
     # ── END SAMPLE MODE ───────────────────────────────────────────────────────
 
-    # WHY no sampling or filtering here: unlike enrich_courses.py which took a
-    # CSC-only sample for a quick proof-of-concept, this script's whole purpose
-    # is to produce a complete enriched dataset. Every course gets scored so
-    # that difficulty/workload metadata is uniformly available at query time —
-    # no gaps that would silently break "heavy semester" warnings for non-CS courses.
-    print(f"\nEnriching {len(all_courses)} courses:")
+    print(f"\nBuilding {len(all_courses)} batch requests...")
 
-    enriched: list[dict] = []
-    for i, course in enumerate(all_courses, 1):
-        code = course.get("code", "")
-        print(f"\n[{i}/{len(all_courses)}] Scoring {code}...")
+    # WHY we build all requests before submitting any: the Batches API is a
+    # single call that takes the full list up front. This differs from the old
+    # synchronous approach where each course triggered its own API call. Here
+    # we front-load all the prompt construction, then hand everything off at once.
+    requests: list[Request] = []
+    for i, course in enumerate(all_courses):
+        requests.append(
+            Request(
+                # WHY numeric index as custom_id: course codes can contain
+                # characters (slashes, dots) that may violate the Batches API's
+                # ID validation, and some cross-listed codes appear twice. A
+                # simple sequential index is always valid and unique.
+                custom_id=f"course-{i}",
+                params=MessageCreateParamsNonStreaming(
+                    model="claude-haiku-4-5",
+                    max_tokens=300,
+                    messages=[{"role": "user", "content": build_prompt(course)}],
+                ),
+            )
+        )
 
-        scores = estimate_scores(client, course)
+    # Submit the entire set in one call — Anthropic queues and processes async.
+    # WHY one call instead of many: beyond the 50% cost discount, batching
+    # eliminates per-request network overhead and means we never hit the
+    # per-minute rate limit that would throttle a large synchronous loop.
+    print(f"Submitting batch of {len(requests)} courses to the Batches API...")
+    batch = client.messages.batches.create(requests=requests)
+    print(f"Batch ID : {batch.id}")
+    print(f"Status   : {batch.processing_status}")
+    print("Polling every 60 s until the batch ends (most batches finish in < 1 hr)...")
 
-        if scores["difficulty"] is not None:
-            # WHY /10 for both: workload is now on a 1–10 scale to match difficulty
-            # and give finer resolution between e.g. 3 hrs/week and 5 hrs/week.
-            print(f"  difficulty={scores['difficulty']}/10  workload={scores['workload']}/10")
+    # WHY polling instead of webhooks: this is a one-shot CLI script, not a
+    # server. A simple sleep-and-check loop is the right tool here. The SDK
+    # handles any transient HTTP errors on the retrieve call automatically.
+    while True:
+        batch = client.messages.batches.retrieve(batch.id)
+        counts = batch.request_counts
+        print(
+            f"  {batch.processing_status} — "
+            f"processing: {counts.processing}  "
+            f"succeeded: {counts.succeeded}  "
+            f"errored: {counts.errored}"
+        )
+        if batch.processing_status == "ended":
+            break
+        time.sleep(60)
+
+    print(f"\nBatch ended — {counts.succeeded} succeeded, {counts.errored} errored")
+
+    # Stream results out of the batch. WHY results() instead of paginating
+    # manually: the SDK's results() method handles the server-sent results file
+    # transparently, yielding one BetaMessageBatchIndividualResponse per course.
+    results_map: dict[str, dict] = {}
+    for result in client.messages.batches.results(batch.id):
+        if result.result.type == "succeeded":
+            raw = result.result.message.content[0].text.strip()
+            results_map[result.custom_id] = parse_scores(raw)
         else:
-            print(f"  ERROR: {scores['difficulty_reasoning']}")
+            # WHY not raising here: a single bad request shouldn't abort the
+            # entire run after a potentially long batch wait. We record None
+            # scores so callers can identify and retry specific failures without
+            # resubmitting everything.
+            results_map[result.custom_id] = {
+                "difficulty": None,
+                "workload": None,
+                "difficulty_reasoning": f"BATCH_ERROR: {result.result.type}",
+            }
 
-        print(f"  {scores['difficulty_reasoning']}")
-
+    # Merge scores back into the original course list, preserving order.
+    # WHY not iterate results_map directly: the batch returns results in
+    # arbitrary order; we want the output file to match the input order.
+    enriched: list[dict] = []
+    for i, course in enumerate(all_courses):
+        custom_id = f"course-{i}"
+        scores = results_map.get(
+            custom_id,
+            {
+                "difficulty": None,
+                "workload": None,
+                "difficulty_reasoning": "MISSING_RESULT",
+            },
+        )
+        code = course.get("code", "")
+        if scores["difficulty"] is not None:
+            print(
+                f"  {code}: difficulty={scores['difficulty']}/10  "
+                f"workload={scores['workload']}/10  — "
+                f"{scores['difficulty_reasoning']}"
+            )
+        else:
+            print(f"  {code}: ERROR — {scores['difficulty_reasoning']}")
         enriched.append({**course, **scores})
 
     output_path = resolve_output_path(OUTPUT_FILENAME)

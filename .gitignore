@@ -230,3 +230,5 @@ backend/consolidate_courses.py
 backend/course_codes.json
 backend/course_embeddings.npy
 backend/build_embeddings.py
+backend/scripts/
+backend/courses_all_enriched.json
