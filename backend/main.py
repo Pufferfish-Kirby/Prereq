@@ -3,18 +3,47 @@
 import os
 from dotenv import load_dotenv
 import anthropic
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from scoring import recommend_courses, explain, explain_structured, search_by_message, courses as course_catalog
+from chat_db import init_db, create_session, list_sessions, get_messages, save_message, update_session_title
+from reviews_db import init_reviews_db, save_review, get_reviews
 
 # Load ANTHROPIC_API_KEY from .env so we never hardcode secrets in source.
 load_dotenv()
 claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
+# Limiter uses the client's IP address as the rate-limit key so each unique
+# visitor gets their own independent counter.  get_remote_address reads from
+# the X-Forwarded-For header (if present) then falls back to request.client.host,
+# which is the right behaviour both locally and behind a reverse proxy.
+limiter = Limiter(key_func=get_remote_address)
+
 # FastAPI() — note the parentheses. Without them `app` would be the class itself,
 # not an instance, so every method call below would crash at startup.
 app = FastAPI()
+
+# Attach the limiter to app.state so slowapi's decorator can find it at request time.
+# WHY app.state and not a global: Starlette's state bag is the idiomatic place to
+# store per-application singletons that middleware and decorators need to reach.
+app.state.limiter = limiter
+
+# Register slowapi's built-in 429 handler.  Without this, exceeding the limit would
+# raise an unhandled RateLimitExceeded exception and return a 500 instead of a 429.
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# WHY call init_db() here instead of in a startup event:
+#     FastAPI startup events run after the app object is constructed but
+#     before the first request — same timing as calling it right here, but
+#     this placement is simpler and immediately obvious.  The function uses
+#     CREATE TABLE IF NOT EXISTS so it is safe to call on every restart
+#     without wiping data or raising errors.
+init_db()
+init_reviews_db()  # idempotent — creates course_reviews table if missing
 
 # CORSMiddleware lets the browser make requests from the React dev server
 # (localhost:5173) to this API (localhost:8000). Without it, browsers block
@@ -56,6 +85,9 @@ class ChatRequest(BaseModel):
     # history lets the frontend send the previous turns so Claude has context
     # for multi-turn conversations without us needing a server-side session store.
     history: list[ChatMessage] = []
+    # session_id is optional — when provided, the server persists the exchange
+    # to SQLite so conversations survive page reloads and browser closes.
+    session_id: int | None = None
 
 
 class ChatResponse(BaseModel):
@@ -90,7 +122,12 @@ def _build_course_context(message: str) -> str:
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(data: ChatRequest) -> ChatResponse:
+@limiter.limit("20/minute")
+# WHY request: Request is the first parameter:
+#     slowapi inspects the route handler's signature to find the Request object so
+#     it can read the client IP and track the rate-limit counter.  It MUST be the
+#     first parameter and typed as fastapi.Request — slowapi won't find it otherwise.
+async def chat(request: Request, data: ChatRequest) -> ChatResponse:
     # Rebuild the full message list: prior turns (from the frontend) + the new user message.
     # Anthropic expects a flat list of {"role": ..., "content": ...} dicts.
     messages = [{'role': msg.role, 'content': msg.content} for msg in data.history]
@@ -113,7 +150,47 @@ async def chat(data: ChatRequest) -> ChatResponse:
     except anthropic.APIError as e:
         raise HTTPException(status_code=502, detail=f"Claude API error: {e}")
 
-    return ChatResponse(response=result.content[0].text)
+    assistant_text = result.content[0].text
+
+    # Persist the exchange to SQLite when the caller supplies a session_id.
+    # WHY check existing messages before updating the title:
+    #     We only want to auto-title on the very first message so subsequent
+    #     messages don't silently overwrite a title the user might expect to
+    #     stay stable.  Checking len == 0 is cheaper than a separate COUNT query.
+    if data.session_id is not None:
+        existing = get_messages(data.session_id)
+        if len(existing) == 0:
+            # Truncate to 60 chars so the sidebar stays readable without wrapping.
+            title = data.message[:60] + ("..." if len(data.message) > 60 else "")
+            update_session_title(data.session_id, title)
+        save_message(data.session_id, "user", data.message)
+        save_message(data.session_id, "assistant", assistant_text)
+
+    return ChatResponse(response=assistant_text)
+
+
+@app.post("/chats")
+def new_chat_session() -> dict:
+    """Create a new chat session and return its id, title, and created_at."""
+    return create_session()
+
+
+@app.get("/chats")
+def get_chat_sessions() -> list:
+    """Return all chat sessions newest-first, each with a message_count."""
+    return list_sessions()
+
+
+@app.get("/chats/{session_id}/messages")
+def get_chat_messages(session_id: int) -> list:
+    """Return all messages for a session in chronological order."""
+    return get_messages(session_id)
+
+
+class ReviewRequest(BaseModel):
+    course_code: str
+    rating: int       # 1–5
+    review_text: str = ""
 
 
 class RequestData(BaseModel):
@@ -146,3 +223,14 @@ def recommend(data: RequestData) -> list:
             "reasons": explain_structured(course, preferences),
         })
     return result
+
+
+@app.post("/reviews")
+def post_review(data: ReviewRequest) -> dict:
+    if not 1 <= data.rating <= 5:
+        raise HTTPException(status_code=400, detail="rating must be between 1 and 5")
+    return save_review(data.course_code, data.rating, data.review_text)
+
+@app.get("/reviews/{course_code}")
+def get_course_reviews(course_code: str) -> list:
+    return get_reviews(course_code)

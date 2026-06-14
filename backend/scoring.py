@@ -2,6 +2,7 @@
 import json
 import re
 from pathlib import Path
+from reviews_db import get_avg_rating
 
 # Use __file__ so this works regardless of which directory the process is launched from.
 # Without this, `open("courses_slim.json")` resolves against CWD, which breaks when
@@ -143,6 +144,9 @@ for c in data:
         credits=c['credit_value'],
         difficulty=c.get("difficulty") or 5,  # AI-scored 1–10; fallback to 5 if null/missing/0
         workload=c.get("workload") or 5,       # AI-scored 1–10; fallback to 5 if null/missing/0
+        # Pre-computed once at startup into Course objects rather than queried per request,
+        # keeping the hot recommendation path O(n) without DB calls on every /recommend hit.
+        rating=get_avg_rating(c['code']),  # None when no reviews exist; Course uses RATING_NEUTRAL fallback
     ))
 
 def _interest_score(course: "Course", interests: list[str]) -> float:
