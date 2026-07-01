@@ -121,13 +121,16 @@ def get_messages(session_id: int) -> list[dict]:
     """
     Return all messages for a session in chronological order.
 
-    Returns: [{ role, content }, ...]  — only the fields the Anthropic API
-    and the frontend actually need, keeping the payload small.
+    Returns: [{ id, role, content }, ...]
+    WHY id is included: the frontend needs a stable identifier per message to
+    support editing — when a user edits a past message, we have to tell the
+    DB exactly which row (and everything after it) to discard. Array index
+    isn't reliable for that once messages have been through DB storage/reload.
     """
     conn = _get_conn()
     try:
         rows = conn.execute(
-            "SELECT role, content FROM chat_messages WHERE session_id = ? ORDER BY id ASC",
+            "SELECT id, role, content FROM chat_messages WHERE session_id = ? ORDER BY id ASC",
             (session_id,),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -135,13 +138,41 @@ def get_messages(session_id: int) -> list[dict]:
         conn.close()
 
 
-def save_message(session_id: int, role: str, content: str) -> None:
-    """Insert one message into the session."""
+def save_message(session_id: int, role: str, content: str) -> int:
+    """Insert one message into the session and return its new id."""
+    conn = _get_conn()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)",
+            (session_id, role, content),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def delete_messages_from(session_id: int, message_id: int) -> None:
+    """
+    Delete a message and every message after it (by id) within one session.
+
+    WHY this exists: editing a past message means the conversation branches —
+    the old reply (and anything the user sent after it) no longer applies to
+    the corrected message. Rather than support multiple branches (real
+    complexity for no payoff in a single-user local MVP), we just discard the
+    old tail and let the edited message start a fresh one, matching how
+    ChatGPT-style "edit and resend" works.
+
+    WHY id >= message_id, not created_at: CURRENT_TIMESTAMP has whole-second
+    resolution, so a user message and its assistant reply (saved a moment
+    apart) can tie on created_at. The autoincrement id has no such collision
+    and is strictly ordered, so it's the only reliable "from here on" cutoff.
+    """
     conn = _get_conn()
     try:
         conn.execute(
-            "INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)",
-            (session_id, role, content),
+            "DELETE FROM chat_messages WHERE session_id = ? AND id >= ?",
+            (session_id, message_id),
         )
         conn.commit()
     finally:

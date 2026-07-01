@@ -1,5 +1,6 @@
 # Remember to call venv/Scripts/activate to get here
 # Also run uvicorn main:app --reload --port 8000
+import logging
 import os
 from dotenv import load_dotenv
 import anthropic
@@ -10,13 +11,19 @@ from slowapi.errors import RateLimitExceeded
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from scoring import recommend_courses, explain, explain_structured, search_by_message, courses as course_catalog
-from chat_db import init_db, create_session, list_sessions, get_messages, save_message, update_session_title
+from chat_db import init_db, create_session, list_sessions, get_messages, save_message, update_session_title, delete_messages_from
 from reviews_db import init_reviews_db, save_review, get_reviews
 from program_data import search_programs_by_message, load_programs
 
 # Load ANTHROPIC_API_KEY from .env so we never hardcode secrets in source.
 load_dotenv()
 claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+# Module-level logger — WHY not print(): logging lets us control verbosity via
+# the LOG_LEVEL env var (already in .env.example) and routes messages through
+# stderr with timestamps/levels, without pulling in a whole logging framework.
+# This is stdlib-only, so it doesn't count as a new dependency.
+logger = logging.getLogger(__name__)
 
 # Limiter uses the client's IP address as the rate-limit key so each unique
 # visitor gets their own independent counter.  get_remote_address reads from
@@ -97,13 +104,23 @@ class ChatRequest(BaseModel):
     # session_id is optional — when provided, the server persists the exchange
     # to SQLite so conversations survive page reloads and browser closes.
     session_id: int | None = None
+    # Set when the user edited a previously-sent message rather than typing a
+    # new one. When present (and session_id is too), we delete this message
+    # and everything after it before saving the edited version + new reply,
+    # so the conversation doesn't fork into two branches in the DB.
+    edit_message_id: int | None = None
 
 
 class ChatResponse(BaseModel):
     response: str
+    # IDs of the newly-saved rows, so the frontend can attach them to its
+    # local message objects — needed so a message can be edited again later
+    # (delete_messages_from requires a real DB id, not an array index).
+    user_message_id: int | None = None
+    assistant_message_id: int | None = None
 
 
-def _build_course_context(message: str) -> str:
+def _build_course_context(message: str, extra_codes: set[str] | None = None) -> str:
     """
     Search the course catalog for courses relevant to the user's message and
     format them as a short context block to append to the system prompt.
@@ -114,10 +131,32 @@ def _build_course_context(message: str) -> str:
         the top 5 relevant courses per message, we keep the prompt tight while
         still grounding Claude's answers in real UofT course data.
 
+    WHY extra_codes exists (bug fix):
+        search_by_message() only does generic semantic search over the raw
+        message text — it has no idea a matched program (see
+        _build_program_context) just referenced specific course codes like
+        "CSC236H1 OR CSC240H1". Semantic top-5 can easily pick one half of an
+        OR-pair (CSC240H1) and miss the other (CSC236H1), so Claude ends up
+        saying "CSC236H1 (not detailed in my info)" even though the course
+        exists in the catalog with full prerequisite text. extra_codes lets
+        the caller pass in codes that MUST be exact-looked-up and included,
+        regardless of what semantic search alone would have surfaced.
+
     Returns an empty string if no relevant courses are found so the system
     prompt stays clean when the message isn't course-related.
     """
     relevant = search_by_message(message, course_catalog, top_n=5)
+    seen_codes = {course.get_course_code() for course, _ in relevant}
+
+    # Exact lookup for any extra codes not already covered by semantic search.
+    # O(1) code -> Course map, same pattern already used in scoring.py:888.
+    if extra_codes:
+        code_to_course = {c.get_course_code(): c for c in course_catalog}
+        for code in extra_codes:
+            if code not in seen_codes and code in code_to_course:
+                relevant.append((code_to_course[code], 0.0))
+                seen_codes.add(code)
+
     if not relevant:
         return ""
 
@@ -130,7 +169,7 @@ def _build_course_context(message: str) -> str:
     return "\n".join(lines)
 
 
-def _build_program_context(message: str) -> str:
+def _build_program_context(message: str) -> tuple[str, list["Program"]]:
     """
     Search the program catalog for programs relevant to the user's message and
     format them as a context block to append to the system prompt.
@@ -141,21 +180,29 @@ def _build_program_context(message: str) -> str:
         course line. Two programs already provides substantial context without
         crowding out the course context block.
 
-    Returns empty string when no programs are relevant, the catalog is empty,
+    WHY this now also returns the matched Program objects (not just the
+    string): the caller needs them to look up year-scoped course codes (see
+    Program.get_course_codes_for_year in program_data.py) so it can widen the
+    course context with the exact courses these programs reference for the
+    year the student asked about. Checked with grep that _build_program_context
+    has no other callers, so widening the return type here is safe.
+
+    Returns ("", []) when no programs are relevant, the catalog is empty,
     or the program embedding index hasn't been built yet (FileNotFoundError),
     so the server degrades gracefully in all cases.
     """
     if not program_catalog:
-        return ""
+        return "", []
     try:
         relevant = search_programs_by_message(message, program_catalog, top_n=2)
     except FileNotFoundError:
         # program_embeddings.npy not built yet — degrade silently
-        return ""
+        return "", []
     if not relevant:
-        return ""
+        return "", []
 
     lines = ["Relevant UofT programs for this query (use these to inform your answer):"]
+    matched_programs = []
     for prog, score in relevant:
         is_limited = "limited enrolment" in prog.enrolment_general.lower()
         enrol_label = "limited enrolment" if is_limited else "open enrolment"
@@ -164,7 +211,8 @@ def _build_program_context(message: str) -> str:
             f"{prog.completion_summary}, {enrol_label}"
         )
         lines.append(prog.formatted_requirements)
-    return "\n".join(lines)
+        matched_programs.append(prog)
+    return "\n".join(lines), matched_programs
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -174,6 +222,14 @@ def _build_program_context(message: str) -> str:
 #     it can read the client IP and track the rate-limit counter.  It MUST be the
 #     first parameter and typed as fastapi.Request — slowapi won't find it otherwise.
 async def chat(request: Request, data: ChatRequest) -> ChatResponse:
+    # If this is an edit of a past message, wipe it and everything saved after
+    # it FIRST, before any of the logic below. WHY first: the title-recompute
+    # check further down reads get_messages() to see if the session is empty —
+    # if we deleted after that check, an edit to the very first message
+    # wouldn't correctly reset the title.
+    if data.session_id is not None and data.edit_message_id is not None:
+        delete_messages_from(data.session_id, data.edit_message_id)
+
     # Rebuild the full message list: prior turns (from the frontend) + the new user message.
     # Anthropic expects a flat list of {"role": ..., "content": ...} dicts.
     messages = [{'role': msg.role, 'content': msg.content} for msg in data.history]
@@ -181,8 +237,35 @@ async def chat(request: Request, data: ChatRequest) -> ChatResponse:
 
     # Inject relevant courses and programs into the system prompt so Claude can
     # reference real UofT data rather than hallucinating codes or requirements.
-    course_context  = _build_course_context(data.message)
-    program_context = _build_program_context(data.message)
+    program_context, matched_programs = _build_program_context(data.message)
+
+    # Bridge the program context and course context (bug fix): if the message
+    # names a specific year ("second year"), pull the exact course codes that
+    # year's section of each matched program references and force-include them
+    # in the course context, instead of relying purely on generic semantic
+    # search which can pick one half of an "X OR Y" pair and drop the other.
+    #
+    # WHY local-import _detect_year_level here rather than at module level:
+    #     mirrors the existing deferred-import pattern in program_data.py
+    #     (search_programs_by_message importing program_semantic_search from
+    #     embeddings locally) — it's a private helper (leading underscore) that
+    #     belongs to scoring.py's module, so we borrow it rather than
+    #     duplicating the year-phrase regex here.
+    #
+    # WHY only expand when a year IS detected:
+    #     Program.get_course_codes_for_year returns [] for unmatched years, so
+    #     this would be a no-op anyway — but being explicit keeps the "no year
+    #     mentioned -> behave exactly as before" guarantee obvious and testable,
+    #     rather than depending on an empty-list side effect.
+    from scoring import _detect_year_level
+
+    extra_codes: set[str] = set()
+    year = _detect_year_level(data.message)
+    if year is not None:
+        for prog in matched_programs:
+            extra_codes.update(prog.get_course_codes_for_year(year))
+
+    course_context = _build_course_context(data.message, extra_codes=extra_codes)
     system_prompt   = ADVISOR_SYSTEM_PROMPT
     if course_context:
         system_prompt += f"\n\n{course_context}"
@@ -197,7 +280,17 @@ async def chat(request: Request, data: ChatRequest) -> ChatResponse:
             messages=messages,
         )
     except anthropic.APIError as e:
-        raise HTTPException(status_code=502, detail=f"Claude API error: {e}")
+        # WHY log the real exception server-side but return a generic message
+        # to the client: interpolating `e` directly into the HTTP response body
+        # (the old behaviour) risks leaking internal details from the Anthropic
+        # SDK — request IDs, upstream error bodies, sometimes header/auth info —
+        # to whoever is calling this endpoint. Logging it here keeps that detail
+        # available for debugging without exposing it over the wire.
+        logger.error("Claude API error while handling /chat request: %s", e)
+        raise HTTPException(
+            status_code=502,
+            detail="The AI advisor is temporarily unavailable. Please try again shortly.",
+        )
 
     assistant_text = result.content[0].text
 
@@ -206,16 +299,22 @@ async def chat(request: Request, data: ChatRequest) -> ChatResponse:
     #     We only want to auto-title on the very first message so subsequent
     #     messages don't silently overwrite a title the user might expect to
     #     stay stable.  Checking len == 0 is cheaper than a separate COUNT query.
+    user_message_id: int | None = None
+    assistant_message_id: int | None = None
     if data.session_id is not None:
         existing = get_messages(data.session_id)
         if len(existing) == 0:
             # Truncate to 60 chars so the sidebar stays readable without wrapping.
             title = data.message[:60] + ("..." if len(data.message) > 60 else "")
             update_session_title(data.session_id, title)
-        save_message(data.session_id, "user", data.message)
-        save_message(data.session_id, "assistant", assistant_text)
+        user_message_id = save_message(data.session_id, "user", data.message)
+        assistant_message_id = save_message(data.session_id, "assistant", assistant_text)
 
-    return ChatResponse(response=assistant_text)
+    return ChatResponse(
+        response=assistant_text,
+        user_message_id=user_message_id,
+        assistant_message_id=assistant_message_id,
+    )
 
 
 @app.post("/chats")

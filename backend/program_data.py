@@ -126,6 +126,60 @@ def _format_year_section(section: dict) -> str:
     return "\n".join(lines)
 
 
+# Maps a detected year level (1-4) to the completion_requirements JSON key
+# that holds that year's specific section. Year 3 and 4 have no entry here on
+# purpose — see _course_codes_for_year's docstring for why they fall back to
+# "upper_years" instead of a dedicated key.
+_YEAR_SECTION_KEYS: dict[int, str] = {
+    1: "first_year",
+    2: "second_year",
+}
+
+
+def _course_codes_for_year(comp: dict, year: int) -> list[str]:
+    """
+    Extract course codes referenced in the completion-requirements section for
+    a SINGLE year (1-4) only, instead of the whole program.
+
+    WHY not just reuse Program.course_codes (or formatted_requirements) here:
+        Program.course_codes is built by regexing the ENTIRE program JSON
+        record (name, notes, every year, everything) — for the CS Specialist
+        that's 73 codes; the median across all 169 programs is 59, the max is
+        447. Even narrowing to just formatted_requirements (which already
+        concatenates first_year + second_year + third_year + fourth_year +
+        upper_years unconditionally) still yields 66 codes for CS Specialist,
+        because that function renders the whole 4-year program at once. A
+        student asking about second year does not need first/third/fourth
+        year codes injected into the prompt — that defeats the point of
+        scoping this fix to "the year the student actually asked about."
+        Regexing just the one matching JSON section keeps the exact-lookup
+        expansion small and proportional to the question.
+
+    WHY fall back to "upper_years" only for year 3/4, never for 1/2:
+        Many specialist programs (CS included) explicitly split out
+        first_year and second_year, but lump 3rd + 4th year requirements
+        together under a single "upper_years" section (often Group A/B/C
+        course pools that aren't tied to one specific year). So for years 3
+        and 4, checking "upper_years" when the year-specific key is absent
+        recovers real data instead of silently returning nothing. For years
+        1/2, a missing key means the program genuinely has no first/second
+        year requirements worth surfacing — falling back to upper_years there
+        would incorrectly attribute 3rd/4th year courses to a 1st/2nd year
+        question, so we deliberately do NOT fall back in that case.
+
+    Returns an empty list (never the full course_codes set) when no matching
+    section exists at all, per the "don't defeat the point of this fix" rule.
+    """
+    key = _YEAR_SECTION_KEYS.get(year)
+    section = comp.get(key) if key else None
+    if not section and year in (3, 4):
+        section = comp.get("upper_years")
+    if not section or not isinstance(section, dict):
+        return []
+    section_text = json.dumps(section)
+    return sorted(set(m.group(1) for m in _COURSE_CODE_RE.finditer(section_text)))
+
+
 def _format_completion_requirements(comp: dict) -> str:
     """
     Render ALL fields in completion_requirements into a human-readable string
@@ -189,9 +243,20 @@ class Program:
     formatted_requirements: str  # output of _format_completion_requirements()
     course_codes: list[str]      # all UofT course codes extracted via regex
     asip: str | None
+    # Course codes scoped to a single year section (1-4), e.g.
+    # year_course_codes[2] == CS Specialist's second-year codes only.
+    # Populated by _course_codes_for_year at load time — see that function's
+    # docstring for why this exists instead of just using course_codes.
+    # Missing years (no requirements found, even after the upper_years
+    # fallback) simply aren't present as keys.
+    year_course_codes: dict[int, list[str]] = field(default_factory=dict)
 
     def get_program_code(self) -> str:
         return self.program_code
+
+    def get_course_codes_for_year(self, year: int) -> list[str]:
+        """Course codes for one year section only (empty list if none found)."""
+        return self.year_course_codes.get(year, [])
 
     def to_text(self) -> str:
         """
@@ -239,6 +304,15 @@ def load_programs() -> list[Program]:
         all_text = json.dumps(p)
         codes = sorted(set(m.group(1) for m in _COURSE_CODE_RE.finditer(all_text)))
 
+        # Pre-compute per-year course codes once at load time (not on every
+        # request) since programs.json only changes on re-scrape, and there
+        # are only 169 programs x 4 years — negligible cost either way.
+        year_codes = {
+            year: yc
+            for year in (1, 2, 3, 4)
+            if (yc := _course_codes_for_year(comp, year))
+        }
+
         programs.append(Program(
             program_code=p["program_code"],
             name=p["name"],
@@ -248,6 +322,7 @@ def load_programs() -> list[Program]:
             formatted_requirements=_format_completion_requirements(comp),
             course_codes=codes,
             asip=p.get("asip"),
+            year_course_codes=year_codes,
         ))
 
     return programs

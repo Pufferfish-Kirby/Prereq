@@ -206,6 +206,9 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# macOS
+.DS_Store
+
 # Node.js
 node_modules/
 
@@ -216,7 +219,6 @@ frontend/dist/
 # Local env files
 .env.local
 .env.*.local
-.env.example
 
 TOOLS_AND_SETUP.md
 AI_MODEL_GUIDE.md
@@ -230,5 +232,16 @@ backend/consolidate_courses.py
 backend/course_codes.json
 backend/course_embeddings.npy
 backend/build_embeddings.py
+backend/program_codes.json
+backend/program_embeddings.npy
 backend/scripts/
 backend/courses_all_enriched.json
+
+# SQLite database (chat sessions, reviews) - local dev data, not shared via git
+backend/myuoft.db
+
+# Claude Code agent scratch state (per-agent memory, not project config)
+.claude/agent-memory/
+
+# Playwright MCP output (screenshots/traces from browser-driven testing)
+.playwright-mcp/

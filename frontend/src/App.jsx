@@ -149,6 +149,13 @@ function App() {
   const [chatSessions, setChatSessions] = useState([])
   const [currentSessionId, setCurrentSessionId] = useState(null)
 
+  // editingIndex is the array index of the user message currently being edited
+  // (null when nothing is being edited). editingText holds the live textarea
+  // value while editing, kept separate from the message itself so Cancel can
+  // discard changes without having mutated `messages`.
+  const [editingIndex, setEditingIndex] = useState(null)
+  const [editingText, setEditingText] = useState('')
+
   // ── Reviews tab state ──
   const [reviewCourseCode, setReviewCourseCode] = useState('')
   const [reviewRating, setReviewRating] = useState(5)
@@ -180,19 +187,27 @@ function App() {
   // actually have content.  Any leftover empty sessions from earlier runs are
   // hidden without needing a DB migration.
   useEffect(() => {
-    if (activeTab === 'chat') {
-      fetch('http://localhost:8000/chats')
-        .then(r => r.json())
-        .then(sessions => setChatSessions(sessions.filter(s => s.message_count > 0)))
-        .catch(() => {})
-    }
+    if (activeTab === 'chat') refreshSessions()
   }, [activeTab])
+
+  // Re-fetch the session list so the sidebar picks up title changes (first
+  // message auto-renames a session) and newly-created sessions.
+  // WHY extracted: handleChatSend and handleEditMessage both need this exact
+  // refresh after a successful round-trip; keeping one copy means the filter
+  // condition only has to be right in one place.
+  function refreshSessions() {
+    fetch('http://localhost:8000/chats')
+      .then(r => r.json())
+      .then(sessions => setChatSessions(sessions.filter(s => s.message_count > 0)))
+      .catch(() => {})
+  }
 
   // Reset to a blank chat state without touching the DB.
   // The session row is created lazily when the first message is sent.
   function startNewChat() {
     setCurrentSessionId(null)
     setMessages([])
+    setEditingIndex(null)
   }
 
   // Fetch persisted messages for a past session and restore them into the UI.
@@ -206,9 +221,31 @@ function App() {
       const msgs = await res.json()
       setCurrentSessionId(session.id)
       setMessages(msgs)
+      setEditingIndex(null)
     } catch (err) {
       setChatError(`Could not load chat: ${err.message}`)
     }
+  }
+
+  // Shared POST to /chat — used for both brand-new messages and edited/resent
+  // ones. WHY extracted: the two flows send an identical body shape (message,
+  // history, session_id, optionally edit_message_id) and need to handle the
+  // same non-OK-response case, so a change to the request/response contract
+  // (e.g. the user_message_id/assistant_message_id fields added for editing)
+  // only has to happen in one place.
+  async function postChatMessage(text, history, sessionId, editMessageId = null) {
+    const response = await fetch('http://localhost:8000/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: text,
+        history,
+        session_id: sessionId,
+        edit_message_id: editMessageId,
+      }),
+    })
+    if (!response.ok) throw new Error(`Server error: ${response.status}`)
+    return response.json()
   }
 
   async function handleChatSend(e) {
@@ -235,43 +272,68 @@ function App() {
     }
 
     // Optimistically add the user message to the UI before the response arrives
-    const userMsg = { role: 'user', content: text }
-    const updatedHistory = [...messages, userMsg]
-    setMessages(updatedHistory)
+    const priorHistory = messages // turns before this new one, sent as `history`
+    setMessages([...priorHistory, { role: 'user', content: text }])
     setInputValue('')
     setChatError(null)
     setChatLoading(true)
 
     try {
-      const response = await fetch('http://localhost:8000/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        // Send the full history so Claude can refer to earlier turns.
-        // We exclude the just-added userMsg from history and pass it as `message`
-        // to match the ChatRequest schema: { message, history: prior turns }.
-        body: JSON.stringify({
-          message: text,
-          history: messages, // prior turns only, not the one we just added
-          session_id: sessionId,
-        }),
-      })
-
-      if (!response.ok) throw new Error(`Server error: ${response.status}`)
-
-      const data = await response.json()
-      // Tag this reply with `animate: true` so TypewriterMarkdown reveals it
-      // word-by-word. Replies restored from history (loadChat) never carry this
-      // flag, which is exactly what keeps past sessions from re-typing.
-      setMessages([...updatedHistory, { role: 'assistant', content: data.response, animate: true }])
-
-      // Re-fetch session list so the sidebar title updates (first message auto-renames
-      // the session) and the new session appears for the first time.
-      fetch('http://localhost:8000/chats')
-        .then(r => r.json())
-        .then(sessions => setChatSessions(sessions.filter(s => s.message_count > 0)))
-        .catch(() => {})
+      const data = await postChatMessage(text, priorHistory, sessionId)
+      // Tag the reply with `animate: true` so TypewriterMarkdown reveals it
+      // word-by-word, and tag both turns with their DB ids so the user
+      // message can be edited later (editing needs a real row id, not an
+      // array index). Replies restored from history (loadChat) never carry
+      // `animate`, which is exactly what keeps past sessions from re-typing.
+      setMessages([
+        ...priorHistory,
+        { role: 'user', content: text, id: data.user_message_id },
+        { role: 'assistant', content: data.response, animate: true, id: data.assistant_message_id },
+      ])
+      refreshSessions()
     } catch (err) {
       setChatError(err.message)
+    } finally {
+      setChatLoading(false)
+    }
+  }
+
+  function cancelEdit() {
+    setEditingIndex(null)
+    setEditingText('')
+  }
+
+  // Edit a previously-sent user message and resend it. This discards every
+  // message after it (both locally and in the DB, via edit_message_id) since
+  // the old reply no longer applies to the corrected question — matches the
+  // "edit and resend" behaviour of ChatGPT-style assistants rather than
+  // trying to support branching conversations.
+  async function handleEditMessage(idx) {
+    const trimmed = editingText.trim()
+    const original = messages[idx]
+    if (!trimmed || chatLoading || !original || original.role !== 'user') return
+
+    const priorHistory = messages.slice(0, idx) // everything strictly before the edited turn
+    const fullConversationBeforeEdit = messages // kept to restore on failure
+    setMessages([...priorHistory, { role: 'user', content: trimmed, id: original.id }])
+    setEditingIndex(null)
+    setEditingText('')
+    setChatError(null)
+    setChatLoading(true)
+
+    try {
+      const data = await postChatMessage(trimmed, priorHistory, currentSessionId, original.id)
+      setMessages([
+        ...priorHistory,
+        { role: 'user', content: trimmed, id: data.user_message_id },
+        { role: 'assistant', content: data.response, animate: true, id: data.assistant_message_id },
+      ])
+      refreshSessions()
+    } catch (err) {
+      setChatError(err.message)
+      // Restore the pre-edit conversation so a failed resend doesn't silently
+      // delete the user's original message and its reply from the view.
+      setMessages(fullConversationBeforeEdit)
     } finally {
       setChatLoading(false)
     }
@@ -637,31 +699,108 @@ function App() {
                   </p>
                 )}
 
-                {messages.map((msg, idx) => (
-                  <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    {/* Subtle shadow on both bubble types lifts the thread off
-                        the flat blue and improves message separation. */}
-                    <div className={`
-                      max-w-[80%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed shadow-sm
-                      ${msg.role === 'user'
-                        ? 'bg-white text-uoft-blue rounded-br-sm'
-                        : 'bg-white/15 ring-1 ring-white/10 text-white rounded-bl-sm'}
-                    `}>
-                      {msg.role === 'assistant'
-                        ? <TypewriterMarkdown
-                            content={msg.content}
-                            // Only fresh replies carry animate:true (set in
-                            // handleChatSend). History messages lack the flag →
-                            // render instantly. Coerced to boolean so undefined
-                            // (history) becomes a clean false.
-                            animate={!!msg.animate}
-                            onReveal={() => setScrollTick((t) => t + 1)}
+                {messages.map((msg, idx) => {
+                  const isUser = msg.role === 'user'
+                  const isEditingThis = isUser && editingIndex === idx
+
+                  if (isEditingThis) {
+                    return (
+                      <div key={idx} className="flex justify-end">
+                        <div className="max-w-[80%] w-full flex flex-col items-end gap-1.5">
+                          <textarea
+                            autoFocus
+                            value={editingText}
+                            onChange={(e) => setEditingText(e.target.value)}
+                            onKeyDown={(e) => {
+                              // Enter resends (matches the composer below);
+                              // Shift+Enter would be for a newline, Escape cancels.
+                              if (e.key === 'Enter' && !e.shiftKey) {
+                                e.preventDefault()
+                                handleEditMessage(idx)
+                              } else if (e.key === 'Escape') {
+                                cancelEdit()
+                              }
+                            }}
+                            rows={2}
+                            className="
+                              w-full rounded-2xl rounded-br-sm bg-white text-uoft-blue text-sm
+                              leading-relaxed px-4 py-2.5 resize-none shadow-sm
+                              focus:outline-none focus:ring-2 focus:ring-white/50
+                            "
                           />
-                        : msg.content
-                      }
+                          <div className="flex gap-2">
+                            <button
+                              onClick={cancelEdit}
+                              className="text-xs text-white/60 hover:text-white px-2 py-1 transition"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              onClick={() => handleEditMessage(idx)}
+                              disabled={!editingText.trim()}
+                              className="
+                                text-xs font-semibold bg-white text-uoft-blue rounded-lg px-3 py-1
+                                hover:bg-white/90 disabled:opacity-40 transition
+                              "
+                            >
+                              Save &amp; resend
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )
+                  }
+
+                  return (
+                    <div key={idx} className={`group flex ${isUser ? 'justify-end' : 'justify-start'}`}>
+                      <div className={`flex items-center gap-1 max-w-[80%] ${isUser ? 'flex-row-reverse' : ''}`}>
+                        {/* Subtle shadow on both bubble types lifts the thread off
+                            the flat blue and improves message separation. */}
+                        <div className={`
+                          rounded-2xl px-4 py-2.5 text-sm leading-relaxed shadow-sm
+                          ${isUser
+                            ? 'bg-white text-uoft-blue rounded-br-sm'
+                            : 'bg-white/15 ring-1 ring-white/10 text-white rounded-bl-sm'}
+                        `}>
+                          {msg.role === 'assistant'
+                            ? <TypewriterMarkdown
+                                content={msg.content}
+                                // Only fresh replies carry animate:true (set in
+                                // handleChatSend). History messages lack the flag →
+                                // render instantly. Coerced to boolean so undefined
+                                // (history) becomes a clean false.
+                                animate={!!msg.animate}
+                                onReveal={() => setScrollTick((t) => t + 1)}
+                              />
+                            : msg.content
+                          }
+                        </div>
+
+                        {/* Edit affordance — only on user messages, only once the
+                            message has a real DB id (a message that failed to
+                            save has no id to truncate from), hidden until hover
+                            so the thread doesn't look cluttered with icons. */}
+                        {isUser && (
+                          <button
+                            onClick={() => { setEditingIndex(idx); setEditingText(msg.content) }}
+                            disabled={chatLoading || !msg.id}
+                            title="Edit message"
+                            className="
+                              opacity-0 group-hover:opacity-100 transition-opacity
+                              shrink-0 p-1.5 rounded-full text-white/50
+                              hover:text-white hover:bg-white/10 disabled:opacity-0
+                            "
+                          >
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
+                              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5Z" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  )
+                })}
 
                 {/* Typing indicator — shown while waiting for Claude's response */}
                 {chatLoading && (
