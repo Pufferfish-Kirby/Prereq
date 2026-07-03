@@ -24,6 +24,8 @@ class Course:
         difficulty: int = 5,
         rating: float | None = None,
         reviews: list[str] | None = None,
+        breadth: list[str] | None = None,
+        sessions: list[str] | None = None,
     ) -> None:
         self._code = code
         self._name = name
@@ -36,19 +38,63 @@ class Course:
         self.difficulty = difficulty
         self.rating = rating
         self.reviews = reviews if reviews is not None else []
-    
+        # Kept as their own fields (not folded into `tags`) so the chat context
+        # builder can surface them verbatim to Claude. `tags` intentionally
+        # flattens department+breadth for keyword scoring, which loses the
+        # "this is a breadth requirement" vs "this is a department" distinction —
+        # for RAG context we want the real breadth categories, unmangled.
+        self._breadth = breadth if breadth is not None else []
+        self._sessions = sessions if sessions is not None else []
+
     def get_course_code(self) -> str:
         return self._code
     def get_name(self) -> str:
         return self._name
+    def get_description(self) -> str:
+        return self.description
     def get_prerequisites(self) -> list[str]:
         return self._prerequisites
     def get_corequisites(self) -> list[str]:
         return self._corequisites
     def get_credits(self) -> float:
         return self._credits
+    def get_breadth(self) -> list[str]:
+        # Raw breadth-requirement strings as scraped, e.g.
+        # "The Physical and Mathematical Universes (5)". Returned as-is so the
+        # trailing category number is preserved — callers can show it verbatim.
+        return self._breadth
+    def get_sessions(self) -> list[str]:
+        # Raw UofT session codes (e.g. "20269", "20271"). Prefer
+        # get_terms_offered() for anything user-facing.
+        return self._sessions
+    def get_terms_offered(self) -> list[str]:
+        # Translate the opaque 5-digit session codes into human-readable terms.
+        # WHY: the scraped data stores sessions as codes like "20269"/"20271"
+        # whose last digit encodes the term (UofT convention: 9=Fall, 1=Winter,
+        # 5=Summer). Claude can't reason about these codes, so we decode them to
+        # "Fall"/"Winter"/"Summer" before injecting into the prompt context.
+        # De-duplicated (a Y course can list the same term across two years)
+        # while preserving first-seen order.
+        term_by_last_digit = {"9": "Fall", "1": "Winter", "5": "Summer"}
+        terms: list[str] = []
+        for code in self._sessions:
+            term = term_by_last_digit.get(code[-1:]) if code else None
+            if term and term not in terms:
+                terms.append(term)
+        return terms
     def is_eligible(self, completed: list[str]) -> bool:
-        return all(prereq in completed for prereq in self._prerequisites)
+        # self._prerequisites is raw scraped text (e.g. "CSC108H1/ CSC148H1" or
+        # "(STA237H1, STA238H1)"), never a list -- `for prereq in
+        # self._prerequisites` iterated individual characters ('C', 'S', 'C', ...)
+        # and checked those against completed, so this was always effectively
+        # False (except when _prerequisites was "", which vacuously returned True).
+        # Extract the real course codes with the module's existing _COURSE_CODE_RE
+        # (defined below, already used by _find_courses_by_code) instead of writing
+        # a full AND/OR prerequisite parser -- recommend_courses (the only caller)
+        # just needs a "has this student completed something listed here" signal,
+        # not exact boolean-clause precision for "/" (OR) vs "," (AND) groups.
+        required_codes = _COURSE_CODE_RE.findall(self._prerequisites)
+        return all(code in completed for code in required_codes)
 
     def to_text(self) -> str:
         # Joins the most signal-rich fields into one string for embedding.
@@ -147,6 +193,10 @@ for c in data:
         # Pre-computed once at startup into Course objects rather than queried per request,
         # keeping the hot recommendation path O(n) without DB calls on every /recommend hit.
         rating=get_avg_rating(c['code']),  # None when no reviews exist; Course uses RATING_NEUTRAL fallback
+        # Kept separately (in addition to being folded into pseudo_tags above) so
+        # the chat RAG context can present the real breadth categories + terms.
+        breadth=c.get('breadth_requirements', []),
+        sessions=c.get('sessions', []),
     ))
 
 def _interest_score(course: "Course", interests: list[str]) -> float:

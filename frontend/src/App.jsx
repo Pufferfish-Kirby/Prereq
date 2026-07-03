@@ -30,6 +30,26 @@ function getDeviceId() {
 }
 const DEVICE_ID = getDeviceId()
 
+// WHY this exists: Claude occasionally emits a bullet marker alone on its own
+// line, separated from the item's content (often a bold heading) by a blank
+// line — e.g. "•\n\nCSC311H1 — ..." or "-\n\n**CSC311H1 — ...**". CommonMark
+// only treats text as part of a list item if it follows the marker on the
+// same line or is indented under it; a blank line in between breaks that
+// link entirely. remark then parses the bare marker as an EMPTY list item
+// and the following text as an unrelated top-level paragraph — which is
+// exactly the "orphaned bullet, heading rendered on the next line" bug seen
+// in the chat UI. We repair this before handing text to ReactMarkdown by
+// collapsing a marker-only line (plus any blank lines after it) back onto
+// the same line as its content, and normalizing a literal "•" character
+// (which isn't markdown list syntax at all) into a real "-" marker so remark
+// treats it as a list item instead of stray text.
+function normalizeMarkdownLists(text) {
+  return text.replace(
+    /^([ \t]*)(?:[-*+]|•)[ \t]*\r?\n(?:[ \t]*\r?\n)*(?=[ \t]*\S)/gm,
+    '$1- '
+  )
+}
+
 // ── Shared markdown render config ───────────────────────────────────────────
 // Extracted to module scope (not redefined per-render) so BOTH the live
 // typewriter reveal and the settled/history render use byte-for-byte identical
@@ -115,10 +135,14 @@ function TypewriterMarkdown({ content, animate, onReveal }) {
   }, [content, animate, words.length])
 
   // Once fully revealed, render the real markdown so final styling is exact.
+  // WHY normalize here (not earlier, e.g. on arrival from the API): this is
+  // the one spot both render paths (animate === false history restores, and
+  // the post-animation settle) funnel through, so fixing it here covers both
+  // without duplicating the call.
   if (done) {
     return (
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>
-        {content}
+        {normalizeMarkdownLists(content)}
       </ReactMarkdown>
     )
   }

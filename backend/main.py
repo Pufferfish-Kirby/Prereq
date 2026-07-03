@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from scoring import recommend_courses, explain, explain_structured, search_by_message, courses as course_catalog
 from chat_db import init_db, create_session, list_sessions, get_messages, save_message, update_session_title, delete_messages_from, session_belongs_to
 from reviews_db import init_reviews_db, save_review, get_reviews
-from program_data import search_programs_by_message, load_programs
+from program_data import search_programs_by_message, load_programs, Program
 
 # Load ANTHROPIC_API_KEY from .env so we never hardcode secrets in source.
 load_dotenv()
@@ -109,14 +109,41 @@ app.add_middleware(
 # The advisor system prompt is injected on every request rather than stored
 # per-session because we're stateless for now. It gives Claude the context it
 # needs to answer as a UofT academic advisor instead of a generic assistant.
-ADVISOR_SYSTEM_PROMPT = """You are an academic advisor for the University of Toronto.
-Help students with course selection, program requirements, and academic planning.
-Be concise, accurate, and friendly. When recommending courses, mention prerequisites when relevant. Do not
-hallucinate prerequisites, course codes, or anything you are not sure about. 
-"Only answer using the courses provided in the context below. 
-If the context does not contain enough information to answer, 
-say so clearly and suggest the student check the UofT calendar directly. 
-Do not recommend courses that are not in the provided context."""
+ADVISOR_SYSTEM_PROMPT = """You are a friendly, knowledgeable academic advisor for the University of Toronto. \
+Help students with course selection, program requirements, career direction, and academic planning. \
+Be concise and encouraging, and actually answer the question the student asked.
+
+You draw on two different kinds of knowledge, and the rules differ for each:
+
+1. GROUNDED FACTS (strict) — Any specific UofT claim must come only from the
+   context provided below the conversation: course codes, what a specific course
+   covers, prerequisites, corequisites, exclusions, breadth categories, terms a
+   course runs in, and program/degree requirements. Never invent or guess a
+   course code or a prerequisite, and never state one from memory. If the context
+   doesn't contain a course that fits, describe the *kind* of course the student
+   should look for (e.g. "an intro linear algebra course") instead of inventing a
+   code, and point them to the Academic Calendar to confirm the exact offering.
+   When two courses in the context are genuinely similar, never describe one's
+   prerequisites, corequisites, exclusions, or requirements as "similar to" or
+   "the same as" the other — each course's own data must be quoted or
+   paraphrased from its own entry in the context, even if that means repeating
+   near-identical text.
+
+2. GENERAL ADVISING KNOWLEDGE (free) — Use your own knowledge freely for
+   everything that isn't a specific UofT fact: how a field or career works, what
+   skills it needs, and the sensible order to learn them. This is what makes you a
+   good advisor, so lean into it.
+
+For career or topic questions like "what should I take to get into machine
+learning?", combine the two: use your general knowledge to lay out the learning
+path (foundations first, then the concepts that build on them), and use the
+provided course context to fill that path with real UofT course codes. Recommend
+concrete courses from the context whenever they fit, and mention prerequisites so
+the student knows what a course depends on.
+
+The Academic Calendar (https://artsci.calendar.utoronto.ca/) is a supplement for
+verifying specifics like enrolment rules or the latest offering — suggest it to
+confirm details, never as a reason to avoid answering."""
 
 
 class ChatMessage(BaseModel):
@@ -149,22 +176,68 @@ class ChatResponse(BaseModel):
     assistant_message_id: int | None = None
 
 
+# How many semantic-search courses to inject as context per message.
+# WHY 12 (raised from 5): career/topic questions like "what should I take to
+# get into ML?" need a *sequence* of courses (intro programming → data
+# structures → linear algebra → stats → ML), which 5 hits can't cover. Twelve
+# courses at ~350 chars of description+fields each is still a small fraction of
+# the context window, so the token cost is negligible next to the qualizzty gain.
+_COURSE_CONTEXT_TOP_N = 10
+
+# Cap on how much of each course description we inject. Full descriptions run
+# 500–1500+ chars; at 12 courses that would bloat the prompt for little gain.
+# ~280 chars is enough for Claude to understand what a course is about.
+_DESCRIPTION_CHAR_BUDGET = 280
+
+
+def _truncate_description(text: str, limit: int = _DESCRIPTION_CHAR_BUDGET) -> str:
+    """
+    Shorten a course description to roughly `limit` chars, cutting at a word
+    boundary and appending an ellipsis.
+
+    WHY cut at a word boundary rather than a hard slice:
+        A hard text[:280] can end mid-word ("...introduc") which reads as broken
+        data. Backing up to the last space keeps the fragment clean. We only back
+        up if a space exists reasonably far in, so a single very long token
+        doesn't collapse the whole string to empty.
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    last_space = cut.rfind(" ")
+    # Only trim to the last space if it's not too close to the start, otherwise
+    # keep the hard cut (avoids returning almost nothing for space-poor text).
+    if last_space > limit * 0.5:
+        cut = cut[:last_space]
+    return cut.rstrip() + "…"
+
+
 def _build_course_context(message: str, extra_codes: set[str] | None = None) -> str:
     """
     Search the course catalog for courses relevant to the user's message and
-    format them as a short context block to append to the system prompt.
+    format them as a context block to append to the system prompt.
 
     WHY inject here rather than in the system prompt at startup:
         Sending the full 3000+ course catalog to Claude on every request is
         expensive and wastes most of the context window. By filtering to only
-        the top 5 relevant courses per message, we keep the prompt tight while
+        the top few relevant courses per message, we keep the prompt tight while
         still grounding Claude's answers in real UofT course data.
+
+    WHY each course now includes description, breadth and terms (not just
+    code+name+prereqs):
+        The advisor is only allowed to make specific UofT claims from this
+        context (see ADVISOR_SYSTEM_PROMPT). A bare code+name doesn't tell Claude
+        what a course actually covers, so it couldn't confidently place a course
+        in a learning path or explain why it fits. Feeding a (truncated)
+        description, the breadth category, and the terms it runs in lets Claude
+        reason about fit and sequencing without inventing anything.
 
     WHY extra_codes exists (bug fix):
         search_by_message() only does generic semantic search over the raw
         message text — it has no idea a matched program (see
         _build_program_context) just referenced specific course codes like
-        "CSC236H1 OR CSC240H1". Semantic top-5 can easily pick one half of an
+        "CSC236H1 OR CSC240H1". Semantic hits can easily pick one half of an
         OR-pair (CSC240H1) and miss the other (CSC236H1), so Claude ends up
         saying "CSC236H1 (not detailed in my info)" even though the course
         exists in the catalog with full prerequisite text. extra_codes lets
@@ -174,11 +247,11 @@ def _build_course_context(message: str, extra_codes: set[str] | None = None) -> 
     Returns an empty string if no relevant courses are found so the system
     prompt stays clean when the message isn't course-related.
     """
-    relevant = search_by_message(message, course_catalog, top_n=5)
+    relevant = search_by_message(message, course_catalog, top_n=_COURSE_CONTEXT_TOP_N)
     seen_codes = {course.get_course_code() for course, _ in relevant}
 
     # Exact lookup for any extra codes not already covered by semantic search.
-    # O(1) code -> Course map, same pattern already used in scoring.py:888.
+    # O(1) code -> Course map, same pattern already used in scoring.py.
     if extra_codes:
         code_to_course = {c.get_course_code(): c for c in course_catalog}
         for code in extra_codes:
@@ -189,16 +262,34 @@ def _build_course_context(message: str, extra_codes: set[str] | None = None) -> 
     if not relevant:
         return ""
 
-    lines = ["Relevant UofT courses for this query (use these to inform your answer):"]
+    lines = [
+        "Relevant UofT courses for this query. Use these to ground any specific "
+        "course recommendation — do not cite course codes that are not listed here:",
+    ]
     for course, score in relevant:
+        # Prerequisite text is injected verbatim. It often encodes OR-choices
+        # ("CSC236H1/CSC240H1") and grouped requirements — collapsing or
+        # "simplifying" that would misrepresent what the student actually needs,
+        # so we never reformat it.
+        prereqs = course.get_prerequisites() or "none"
+        breadth = "; ".join(course.get_breadth()) or "none listed"
+        terms = ", ".join(course.get_terms_offered()) or "not listed"
+        description = _truncate_description(course.get_description()) or "(no description available)"
+        # One labelled block per course. Explicit field labels (rather than a
+        # dense one-liner) make it unambiguous to Claude which text is the
+        # prereq vs. the breadth category vs. the description.
         lines.append(
-            f"- {course.get_course_code()} — {course.get_name()} "
-            f"(prereqs: {course.get_prerequisites() or 'none'})"
+            f"\n- {course.get_course_code()} — {course.get_name()} "
+            f"({course.get_credits()} credit)\n"
+            f"  Description: {description}\n"
+            f"  Prerequisites: {prereqs}\n"
+            f"  Breadth: {breadth}\n"
+            f"  Terms offered: {terms}"
         )
     return "\n".join(lines)
 
 
-def _build_program_context(message: str) -> tuple[str, list["Program"]]:
+def _build_program_context(message: str) -> tuple[str, list[Program]]:
     """
     Search the program catalog for programs relevant to the user's message and
     format them as a context block to append to the system prompt.
