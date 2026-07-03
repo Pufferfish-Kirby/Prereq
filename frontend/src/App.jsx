@@ -178,6 +178,15 @@ function App() {
   const [chatSessions, setChatSessions] = useState([])
   const [currentSessionId, setCurrentSessionId] = useState(null)
 
+  // WHY a separate open/closed flag instead of a CSS-only solution: below the
+  // md breakpoint the session sidebar becomes an off-canvas drawer (fixed,
+  // hidden by default) rather than sitting side-by-side with the chat panel —
+  // at phone widths the two columns don't have room to coexist (the sidebar's
+  // fixed width alone left ~150px for messages+input, which is why the input
+  // bar was getting pushed off-screen). Above md, this flag is ignored
+  // entirely (sidebar is always visible via the `md:flex` override).
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+
   // editingIndex is the array index of the user message currently being edited
   // (null when nothing is being edited). editingText holds the live textarea
   // value while editing, kept separate from the message itself so Cancel can
@@ -686,10 +695,43 @@ function App() {
         {activeTab === 'chat' && (
           <div className="flex-1 flex gap-4 min-h-0 w-full max-w-4xl mx-auto px-4 py-6">
 
-            {/* ── Session sidebar ── */}
-            <div className="w-52 flex flex-col gap-2 shrink-0">
+            {/* Backdrop behind the sidebar drawer on mobile only — tapping it
+                closes the drawer, same as tapping outside a modal. */}
+            {sidebarOpen && (
+              <div
+                className="fixed inset-0 bg-black/50 z-30 md:hidden"
+                onClick={() => setSidebarOpen(false)}
+              />
+            )}
+
+            {/* ── Session sidebar ──
+                WHY `fixed` + `hidden md:flex` below md instead of a flex-col
+                stack: stacking the full session list above the chat would
+                push the message input further down the page on every load,
+                and a long chat history would bury it below the fold. An
+                off-canvas drawer keeps the input immediately visible while
+                still making past chats reachable via the toggle button. */}
+            <div className={`
+              ${sidebarOpen ? 'flex' : 'hidden'} md:flex
+              fixed md:static inset-y-0 left-0 z-40 md:z-auto
+              w-64 md:w-52 flex-col gap-2 shrink-0
+              bg-uoft-blue md:bg-transparent p-4 md:p-0
+              shadow-2xl md:shadow-none
+            `}>
+              <div className="flex items-center justify-between md:hidden mb-1">
+                <span className="text-white/70 text-xs font-semibold uppercase tracking-wide">Chats</span>
+                <button
+                  onClick={() => setSidebarOpen(false)}
+                  aria-label="Close chat list"
+                  className="text-white/60 hover:text-white p-1 rounded-lg hover:bg-white/10 transition"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4">
+                    <path d="M18 6 6 18" /><path d="M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
               <button
-                onClick={startNewChat}
+                onClick={() => { startNewChat(); setSidebarOpen(false) }}
                 className="w-full bg-white text-uoft-blue font-semibold rounded-lg py-2 text-sm hover:bg-white/90 transition"
               >
                 + New Chat
@@ -698,7 +740,7 @@ function App() {
                 {chatSessions.map(session => (
                   <button
                     key={session.id}
-                    onClick={() => loadChat(session)}
+                    onClick={() => { loadChat(session); setSidebarOpen(false) }}
                     className={`
                       w-full text-left px-3 py-2 rounded-lg text-xs truncate transition
                       ${session.id === currentSessionId
@@ -716,11 +758,28 @@ function App() {
               </div>
             </div>
 
-            {/* ── Chat panel ── */}
-            <div className="flex-1 flex flex-col min-w-0">
-              <div className="text-center mb-4">
-                <h2 className="text-white text-2xl font-bold tracking-tight">AI Advisor</h2>
-                <p className="text-white/60 mt-1 text-xs">
+            {/* ── Chat panel ──
+                WHY pb-16 on mobile: the input form otherwise sits flush
+                against the bottom edge, right under the fixed Feedback FAB
+                (bottom-4 = 16px + ~48px circle). md:pb-0 removes it once the
+                FAB has a whole sidebar's width of clearance to its left. */}
+            <div className="flex-1 flex flex-col min-w-0 pb-16 md:pb-0">
+              <div className="mb-4">
+                <div className="flex items-center gap-2 md:justify-center">
+                  {/* Hamburger toggle — md:hidden because the sidebar is
+                      always visible side-by-side once there's room for it. */}
+                  <button
+                    onClick={() => setSidebarOpen(true)}
+                    aria-label="Open chat list"
+                    className="md:hidden shrink-0 text-white/70 hover:text-white p-1.5 -ml-1.5 rounded-lg hover:bg-white/10 transition"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-5 h-5">
+                      <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
+                    </svg>
+                  </button>
+                  <h2 className="text-white text-2xl font-bold tracking-tight">AI Advisor</h2>
+                </div>
+                <p className="text-white/60 mt-1 text-xs text-center">
                   {currentSessionId ? 'Session active — messages are saved.' : 'Type a message to start a new session.'}
                 </p>
               </div>
@@ -1211,21 +1270,24 @@ function App() {
         target="_blank"
         rel="noopener noreferrer"
         className="
-          fixed bottom-6 right-6 z-50
+          fixed bottom-4 right-4 sm:bottom-6 sm:right-6 z-50
           flex items-center gap-2
           bg-uoft-accent text-uoft-blue font-semibold
-          rounded-full px-4 py-2.5 text-sm
+          rounded-full p-3 sm:px-4 sm:py-2.5 text-sm
           shadow-lg shadow-black/30
           hover:brightness-110 hover:-translate-y-0.5
           active:translate-y-0 transition-all
         "
       >
-        {/* Pencil icon */}
+        {/* Pencil icon. WHY icon-only below sm: the full "Feedback" pill was
+            wide enough to sit directly on top of the review-search bar on
+            phone widths — shrinking to just the icon keeps it reachable
+            without covering nearby inputs/buttons. */}
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4">
           <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
           <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5Z" />
         </svg>
-        Feedback
+        <span className="hidden sm:inline">Feedback</span>
       </a>
     </div>
   )
