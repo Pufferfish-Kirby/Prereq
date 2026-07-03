@@ -5,3 +5,6 @@ anthropic>=0.40.0
 python-dotenv>=1.0.0
 sentence-transformers>=3.0.0
 slowapi>=0.1.9
+# Imported directly in embeddings.py — pinned explicitly rather than relying
+# on it arriving transitively via sentence-transformers.
+numpy>=1.26.0

@@ -4,11 +4,12 @@
 #   ignore entry, one restore step.  When we migrate to PostgreSQL in Phase 2,
 #   both tables move together in the same migration.
 import sqlite3
-from pathlib import Path
 
-# Resolve the DB path relative to this file so the module works regardless of
-# the working directory the server is launched from (backend/, project root, etc.)
-_DB_PATH = Path(__file__).parent / "myuoft.db"
+# WHY import DB_PATH from chat_db instead of recomputing it here:
+#   Both modules need to agree on where the DB file lives, including the
+#   Railway-volume-aware fallback logic in chat_db.py. Duplicating that
+#   resolution here risked the two paths silently drifting apart.
+from chat_db import DB_PATH as _DB_PATH
 
 
 def _connect() -> sqlite3.Connection:

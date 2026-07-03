@@ -8,6 +8,7 @@ WHY sqlite3 instead of SQLAlchemy:
     local MVP, and keeps this module readable at a glance.
 """
 
+import os
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -15,7 +16,16 @@ from typing import Optional
 # Resolve the DB path relative to THIS file so it works regardless of where
 # uvicorn is invoked from (e.g., `cd backend && uvicorn main:app` vs running
 # from the repo root).
-DB_PATH = Path(__file__).parent / "myuoft.db"
+#
+# WHY check RAILWAY_VOLUME_MOUNT_PATH: Railway's filesystem is ephemeral by
+# default — anything written next to this source file is wiped on every
+# redeploy/restart. If a Railway Volume is attached to the service, Railway
+# auto-injects this env var pointing at the persistent mount; when present, we
+# store the DB there instead so chat history and reviews survive redeploys.
+# Locally, and on Railway if no volume is attached, the env var is unset and
+# this falls back to the exact same path as before — zero behavior change.
+DB_DIR = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", Path(__file__).parent))
+DB_PATH = DB_DIR / "myuoft.db"
 
 
 def _get_conn() -> sqlite3.Connection:

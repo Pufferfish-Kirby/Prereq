@@ -229,13 +229,22 @@ backend/courses_slim.json
 backend/data_pulling.py
 backend/practice.py
 backend/consolidate_courses.py
-backend/course_codes.json
-backend/course_embeddings.npy
 backend/build_embeddings.py
-backend/program_codes.json
-backend/program_embeddings.npy
 backend/scripts/
-backend/courses_all_enriched.json
+
+# WHY these ARE tracked despite being generated: main.py's actual runtime
+# code path reads these five files directly (scoring.py, embeddings.py,
+# program_data.py) — they're not build-only intermediates like courses.json/
+# courses_slim.json above. A deploy environment (Railway, etc.) builds from
+# a fresh git clone with no access to this machine's filesystem, so if these
+# aren't committed, the app either crashes on startup (courses_all_enriched.json,
+# read at module import time) or crashes on first /chat request (the .npy/
+# codes.json pairs). Total size is ~9.2MB — trivial for git.
+# backend/course_codes.json
+# backend/course_embeddings.npy
+# backend/program_codes.json
+# backend/program_embeddings.npy
+# backend/courses_all_enriched.json
 
 # SQLite database (chat sessions, reviews) - local dev data, not shared via git
 backend/myuoft.db

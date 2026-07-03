@@ -61,17 +61,28 @@ try:
 except FileNotFoundError:
     program_catalog = []
 
-# CORSMiddleware lets the browser make requests from the React dev server
-# (localhost:5173) to this API (localhost:8000). Without it, browsers block
-# all cross-origin requests before they even reach our route handlers.
-# WHY a specific origin instead of "*":
+# CORSMiddleware lets the browser make requests from the frontend's origin to
+# this API. Without it, browsers block all cross-origin requests before they
+# even reach our route handlers.
+# WHY read from CORS_ORIGINS instead of hardcoding: .env.example has always
+# documented this variable, but nothing actually read it — the origin was
+# hardcoded to the Vite dev server, which would silently break every request
+# once the frontend moves to a real domain (e.g. Vercel) and the backend
+# moves to a real domain (e.g. Railway). Comma-separated so both a Vercel
+# production domain and preview-deploy domains can be listed at once.
+# WHY a specific origin (or list) instead of "*":
 #   The CORS spec forbids combining allow_origins=["*"] with
 #   allow_credentials=True — browsers reject the response entirely.
-#   Listing the exact Vite dev-server URL fixes that, and is also safer
-#   because it won't accidentally expose the API to every website on the internet.
+#   Listing exact origins fixes that, and is also safer because it won't
+#   accidentally expose the API to every website on the internet.
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Vite dev server default port
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -318,19 +329,29 @@ async def chat(request: Request, data: ChatRequest) -> ChatResponse:
 
 
 @app.post("/chats")
-def new_chat_session() -> dict:
+@limiter.limit("20/minute")
+# WHY 20/minute, same as /chat: creating a session is cheap (one INSERT), but
+# unlimited creation would let a single client bloat chat_sessions with junk
+# rows indefinitely, so it gets the same conservative budget as /chat.
+def new_chat_session(request: Request) -> dict:
     """Create a new chat session and return its id, title, and created_at."""
     return create_session()
 
 
 @app.get("/chats")
-def get_chat_sessions() -> list:
+@limiter.limit("60/minute")
+# WHY more generous than the write endpoints: this is a read-only query
+# (SELECT + one LEFT JOIN) with no side effects, and the frontend calls it
+# after every message send to refresh the sidebar — a tight limit here would
+# make normal chatting trip the limiter.
+def get_chat_sessions(request: Request) -> list:
     """Return all chat sessions newest-first, each with a message_count."""
     return list_sessions()
 
 
 @app.get("/chats/{session_id}/messages")
-def get_chat_messages(session_id: int) -> list:
+@limiter.limit("60/minute")
+def get_chat_messages(request: Request, session_id: int) -> list:
     """Return all messages for a session in chronological order."""
     return get_messages(session_id)
 
@@ -348,7 +369,12 @@ class RequestData(BaseModel):
     completed_courses: list[str] = []
 
 @app.post("/recommend")
-def recommend(data: RequestData) -> list:
+@limiter.limit("30/minute")
+# WHY 30/minute, more than /chat but not unlimited: this never calls Claude
+# (no per-request API cost), but it does score the full ~3200-course catalog
+# on every call, so it's not free either — a middle-ground budget between the
+# expensive /chat endpoint and the cheap read-only /chats endpoints.
+def recommend(request: Request, data: RequestData) -> list:
     preferences = {
         "interests": data.interests,
         "preferred_difficulty": data.preferred_difficulty,
@@ -374,11 +400,17 @@ def recommend(data: RequestData) -> list:
 
 
 @app.post("/reviews")
-def post_review(data: ReviewRequest) -> dict:
+@limiter.limit("10/minute")
+# WHY the tightest limit of any endpoint: this is the one place a client can
+# write arbitrary free-text (review_text) into the database. A low limit
+# blunts basic review-spam/flooding attempts without needing a captcha or
+# auth system, which would be over-engineering for a Phase 1 MVP.
+def post_review(request: Request, data: ReviewRequest) -> dict:
     if not 1 <= data.rating <= 5:
         raise HTTPException(status_code=400, detail="rating must be between 1 and 5")
     return save_review(data.course_code, data.rating, data.review_text)
 
 @app.get("/reviews/{course_code}")
-def get_course_reviews(course_code: str) -> list:
+@limiter.limit("60/minute")
+def get_course_reviews(request: Request, course_code: str) -> list:
     return get_reviews(course_code)
