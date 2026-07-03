@@ -61,6 +61,24 @@ try:
 except FileNotFoundError:
     program_catalog = []
 
+# Eagerly warm the embedding pipeline (sentence-transformers model + both
+# .npy indices) at startup instead of leaving it lazy.
+# WHY: get_model()/the index loaders in embeddings.py are lazy singletons —
+# normally a fine pattern, but on Railway the process restarts on every
+# deploy, so whoever sends the FIRST chat message after a deploy pays the
+# full load cost. Measured locally at 10-40+ seconds (dominated by importing
+# torch/sentence-transformers, not the 90MB of weights themselves) stacked on
+# top of the real Claude API latency — indistinguishable from the AI itself
+# being broken. Running a throwaway search here means that cost lands during
+# container startup, before Railway's health check passes and routes real
+# traffic, instead of on some unlucky user's first message.
+try:
+    from embeddings import semantic_search, program_semantic_search
+    semantic_search("warmup", top_n=1)
+    program_semantic_search("warmup", top_n=1)
+except FileNotFoundError:
+    pass  # embeddings not built yet — /chat already degrades gracefully in this case
+
 # CORSMiddleware lets the browser make requests from the frontend's origin to
 # this API. Without it, browsers block all cross-origin requests before they
 # even reach our route handlers.
