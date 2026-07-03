@@ -6,6 +6,30 @@ import './App.css'
 // Replace with your real Google Form URL when ready.
 const FEEDBACK_FORM_URL = 'https://docs.google.com/forms/d/e/1FAIpQLSeV9gY2k3tNVYtPfNwnnKFm97lkWSVtfrh_iTqfFMHJx6_gGA/viewform?usp=dialog'
 
+// WHY an env var instead of hardcoding: the same build needs to hit
+// localhost during development and the deployed Railway backend in
+// production. Vite exposes anything prefixed VITE_ from .env files (or the
+// hosting provider's dashboard, e.g. Vercel) via import.meta.env. Falling
+// back to localhost keeps local dev working with zero setup.
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+
+// WHY a random per-browser id instead of real accounts: this is a Phase 1
+// MVP with no login system, but chat history still needs to be private per
+// visitor (the review database, by contrast, is intentionally shared/global).
+// A UUID generated once and cached in localStorage gives every browser a
+// stable identity across page reloads without any signup flow. It's sent as
+// the X-Device-Id header on chat requests; the backend uses it to scope which
+// sessions a request can see.
+function getDeviceId() {
+  let id = localStorage.getItem('myuoft_device_id')
+  if (!id) {
+    id = crypto.randomUUID()
+    localStorage.setItem('myuoft_device_id', id)
+  }
+  return id
+}
+const DEVICE_ID = getDeviceId()
+
 // ── Shared markdown render config ───────────────────────────────────────────
 // Extracted to module scope (not redefined per-render) so BOTH the live
 // typewriter reveal and the settled/history render use byte-for-byte identical
@@ -196,7 +220,7 @@ function App() {
   // refresh after a successful round-trip; keeping one copy means the filter
   // condition only has to be right in one place.
   function refreshSessions() {
-    fetch('http://localhost:8000/chats')
+    fetch(`${API_URL}/chats`, { headers: { 'X-Device-Id': DEVICE_ID } })
       .then(r => r.json())
       .then(sessions => setChatSessions(sessions.filter(s => s.message_count > 0)))
       .catch(() => {})
@@ -216,7 +240,9 @@ function App() {
   //     from session A bleeding into session B's view.
   async function loadChat(session) {
     try {
-      const res = await fetch(`http://localhost:8000/chats/${session.id}/messages`)
+      const res = await fetch(`${API_URL}/chats/${session.id}/messages`, {
+        headers: { 'X-Device-Id': DEVICE_ID },
+      })
       if (!res.ok) throw new Error(`Server error: ${res.status}`)
       const msgs = await res.json()
       setCurrentSessionId(session.id)
@@ -234,9 +260,9 @@ function App() {
   // (e.g. the user_message_id/assistant_message_id fields added for editing)
   // only has to happen in one place.
   async function postChatMessage(text, history, sessionId, editMessageId = null) {
-    const response = await fetch('http://localhost:8000/chat', {
+    const response = await fetch(`${API_URL}/chat`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Device-Id': DEVICE_ID },
       body: JSON.stringify({
         message: text,
         history,
@@ -260,7 +286,10 @@ function App() {
     let sessionId = currentSessionId
     if (sessionId === null) {
       try {
-        const res = await fetch('http://localhost:8000/chats', { method: 'POST' })
+        const res = await fetch(`${API_URL}/chats`, {
+          method: 'POST',
+          headers: { 'X-Device-Id': DEVICE_ID },
+        })
         if (!res.ok) throw new Error()
         const session = await res.json()
         sessionId = session.id
@@ -359,7 +388,7 @@ function App() {
       // POST to the FastAPI backend running on port 8000.
       // The body shape must match the RequestData Pydantic model in main.py:
       //   interests (list[str]), preferred_difficulty (int), preferred_workload (int)
-      const response = await fetch('http://localhost:8000/recommend', {
+      const response = await fetch(`${API_URL}/recommend`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -391,7 +420,7 @@ function App() {
     setReviewSubmitting(true)
     setReviewSubmitMsg(null)
     try {
-      const res = await fetch('http://localhost:8000/reviews', {
+      const res = await fetch(`${API_URL}/reviews`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -418,7 +447,7 @@ function App() {
     setReviewLookupLoading(true)
     setReviewResults(null)
     try {
-      const res = await fetch(`http://localhost:8000/reviews/${reviewLookupCode.trim().toUpperCase()}`)
+      const res = await fetch(`${API_URL}/reviews/${reviewLookupCode.trim().toUpperCase()}`)
       if (!res.ok) throw new Error(`Server error: ${res.status}`)
       setReviewResults(await res.json())
     } catch (err) {

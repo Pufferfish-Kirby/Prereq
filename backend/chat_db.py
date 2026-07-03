@@ -61,6 +61,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS chat_sessions (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 title      TEXT    NOT NULL DEFAULT 'New Chat',
+                owner_id   TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -74,11 +75,23 @@ def init_db() -> None:
             );
         """)
         conn.commit()
+
+        # WHY a manual migration step here: CREATE TABLE IF NOT EXISTS is a
+        # no-op against a chat_sessions table that already existed before this
+        # column was added (e.g. the table Railway's volume created on first
+        # deploy), so new installs get owner_id for free but existing ones
+        # need it bolted on explicitly.
+        existing_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(chat_sessions)")
+        }
+        if "owner_id" not in existing_columns:
+            conn.execute("ALTER TABLE chat_sessions ADD COLUMN owner_id TEXT")
+            conn.commit()
     finally:
         conn.close()
 
 
-def create_session(title: str = "New Chat") -> dict:
+def create_session(owner_id: str, title: str = "New Chat") -> dict:
     """
     Insert a new chat session row and return it as a plain dict.
 
@@ -87,7 +100,8 @@ def create_session(title: str = "New Chat") -> dict:
     conn = _get_conn()
     try:
         cursor = conn.execute(
-            "INSERT INTO chat_sessions (title) VALUES (?)", (title,)
+            "INSERT INTO chat_sessions (title, owner_id) VALUES (?, ?)",
+            (title, owner_id),
         )
         conn.commit()
         # Fetch the freshly inserted row so we get the DB-generated created_at.
@@ -100,9 +114,9 @@ def create_session(title: str = "New Chat") -> dict:
         conn.close()
 
 
-def list_sessions() -> list[dict]:
+def list_sessions(owner_id: str) -> list[dict]:
     """
-    Return all sessions newest-first, each with a message_count field.
+    Return owner_id's sessions newest-first, each with a message_count field.
 
     WHY include message_count in the list query:
         The sidebar needs to show something useful about each session without
@@ -119,10 +133,32 @@ def list_sessions() -> list[dict]:
                 COUNT(m.id) AS message_count
             FROM chat_sessions s
             LEFT JOIN chat_messages m ON m.session_id = s.id
+            WHERE s.owner_id = ?
             GROUP BY s.id
             ORDER BY s.created_at DESC
-        """).fetchall()
+        """, (owner_id,)).fetchall()
         return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def session_belongs_to(session_id: int, owner_id: str) -> bool:
+    """
+    Check whether a session exists and is owned by owner_id.
+
+    WHY this exists: endpoints that take a session_id (loading messages,
+    posting/editing chat messages) must not trust the caller's claim to own
+    that id — anyone can guess or increment an integer id. Callers check this
+    once up front and 404 on a mismatch, rather than every helper below
+    threading owner_id through and silently no-op'ing on a mismatch.
+    """
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM chat_sessions WHERE id = ? AND owner_id = ?",
+            (session_id, owner_id),
+        ).fetchone()
+        return row is not None
     finally:
         conn.close()
 

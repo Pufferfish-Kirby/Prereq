@@ -4,14 +4,14 @@ import logging
 import os
 from dotenv import load_dotenv
 import anthropic
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from scoring import recommend_courses, explain, explain_structured, search_by_message, courses as course_catalog
-from chat_db import init_db, create_session, list_sessions, get_messages, save_message, update_session_title, delete_messages_from
+from chat_db import init_db, create_session, list_sessions, get_messages, save_message, update_session_title, delete_messages_from, session_belongs_to
 from reviews_db import init_reviews_db, save_review, get_reviews
 from program_data import search_programs_by_message, load_programs
 
@@ -232,7 +232,16 @@ def _build_program_context(message: str) -> tuple[str, list["Program"]]:
 #     slowapi inspects the route handler's signature to find the Request object so
 #     it can read the client IP and track the rate-limit counter.  It MUST be the
 #     first parameter and typed as fastapi.Request — slowapi won't find it otherwise.
-async def chat(request: Request, data: ChatRequest) -> ChatResponse:
+async def chat(request: Request, data: ChatRequest, x_device_id: str = Header(...)) -> ChatResponse:
+    # WHY check ownership before anything else touches session_id: session_id
+    # is a guessable/incrementable integer, so without this check any visitor
+    # could read another visitor's chat history just by sending its id here
+    # (this endpoint both reads via get_messages() below and writes via
+    # save_message/delete_messages_from). 404 rather than 403 so a non-owner
+    # can't even confirm the session exists.
+    if data.session_id is not None and not session_belongs_to(data.session_id, x_device_id):
+        raise HTTPException(status_code=404, detail="Chat session not found")
+
     # If this is an edit of a past message, wipe it and everything saved after
     # it FIRST, before any of the logic below. WHY first: the title-recompute
     # check further down reads get_messages() to see if the session is empty —
@@ -333,9 +342,9 @@ async def chat(request: Request, data: ChatRequest) -> ChatResponse:
 # WHY 20/minute, same as /chat: creating a session is cheap (one INSERT), but
 # unlimited creation would let a single client bloat chat_sessions with junk
 # rows indefinitely, so it gets the same conservative budget as /chat.
-def new_chat_session(request: Request) -> dict:
+def new_chat_session(request: Request, x_device_id: str = Header(...)) -> dict:
     """Create a new chat session and return its id, title, and created_at."""
-    return create_session()
+    return create_session(owner_id=x_device_id)
 
 
 @app.get("/chats")
@@ -344,15 +353,17 @@ def new_chat_session(request: Request) -> dict:
 # (SELECT + one LEFT JOIN) with no side effects, and the frontend calls it
 # after every message send to refresh the sidebar — a tight limit here would
 # make normal chatting trip the limiter.
-def get_chat_sessions(request: Request) -> list:
-    """Return all chat sessions newest-first, each with a message_count."""
-    return list_sessions()
+def get_chat_sessions(request: Request, x_device_id: str = Header(...)) -> list:
+    """Return this device's chat sessions newest-first, each with a message_count."""
+    return list_sessions(owner_id=x_device_id)
 
 
 @app.get("/chats/{session_id}/messages")
 @limiter.limit("60/minute")
-def get_chat_messages(request: Request, session_id: int) -> list:
+def get_chat_messages(request: Request, session_id: int, x_device_id: str = Header(...)) -> list:
     """Return all messages for a session in chronological order."""
+    if not session_belongs_to(session_id, x_device_id):
+        raise HTTPException(status_code=404, detail="Chat session not found")
     return get_messages(session_id)
 
 
