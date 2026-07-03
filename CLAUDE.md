@@ -17,6 +17,22 @@ MyUofT is an AI-powered course planning tool that helps University of Toronto st
 - **AI:** Anthropic Claude API (claude-sonnet-4-6) for conversational course advising
 - **Styling:** Tailwind CSS
 
+### Live Deployment (Beta)
+- **Backend:** Railway, deployed from `backend/` (Root Directory setting) — see
+  `backend/Procfile` and `backend/.python-version`. SQLite persists only if a
+  Railway Volume is attached (`RAILWAY_VOLUME_MOUNT_PATH` env var); without one,
+  `myuoft.db` resets on every redeploy.
+- **Frontend:** Vercel, deployed from `frontend/` (Root Directory setting). When
+  creating/reconfiguring the Vercel project, do NOT use the "Services" preset —
+  it auto-deploys `backend/` too as a serverless function, which breaks SQLite
+  persistence and duplicates Railway. Use a single-app preset instead.
+- **Config wiring:** frontend's `VITE_API_URL` (full URL incl. `https://` — a
+  bare hostname gets treated as a relative path and silently breaks all API
+  calls) must point at the Railway domain; Railway's `CORS_ORIGINS` must
+  exactly match the Vercel domain (scheme, no trailing slash). Vite env vars
+  are baked in at *build* time, not read at runtime — changing the value
+  requires a fresh deploy, and a cached build will keep serving the old value.
+
 ### Future (Phase 2+ — Production)
 - **Database:** PostgreSQL (on AWS RDS)
 - **Cloud:** AWS (EC2/ECS for compute, S3 for static assets, CloudFront CDN)
@@ -241,6 +257,15 @@ The AI advisor should receive:
 - **Prerequisite Validation:** Checks that the generated plan respects all prerequisites
 - **Course Recommendations:** "Students who liked X also took Y" style suggestions
 - **What-If Analysis:** "What would my plan look like if I switched from CS Major to CS Specialist?"
+
+### Chat Privacy Model
+Chat sessions are private per-browser via an anonymous device ID (UUID in
+`localStorage`, sent as `X-Device-Id` header), not real accounts — Phase 2 is
+where real auth (Clerk) replaces this. Course reviews remain global/shared by
+design. Any new chat-session endpoint must require `x_device_id: str =
+Header(...)` and call `session_belongs_to()` (`backend/chat_db.py`) before
+returning or mutating a session — session ids are guessable integers with no
+other access control.
 
 ---
 

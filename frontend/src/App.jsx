@@ -82,10 +82,15 @@ function TypewriterMarkdown({ content, animate, onReveal }) {
     if (!animate) return // history / already-settled: nothing to schedule
 
     let count = 0
-    // ~3 word-tokens per tick at 40ms ≈ ChatGPT's perceived pace. Stepping by
-    // chunks (not one char) keeps it lively without thrashing React renders.
-    const CHUNK = 3
-    const TICK_MS = 40
+    // WHY 8/25 instead of the original 3/40: the reveal runs AFTER the full
+    // response already arrived from the network, so total perceived latency
+    // is network_time + reveal_time, not max(both). At 3 tokens/40ms, a
+    // near-max_tokens (1024) reply added ~20+ seconds of pure animation on
+    // top of the real ~4-5s API call — indistinguishable from the AI itself
+    // being slow. This pace still reads as a lively type-out (just under 3x
+    // faster) without ballooning reply time for long answers.
+    const CHUNK = 8
+    const TICK_MS = 25
     const timer = setInterval(() => {
       count += CHUNK
       if (count >= words.length) {
