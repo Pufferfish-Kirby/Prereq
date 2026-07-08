@@ -8,3 +8,4 @@ slowapi>=0.1.9
 # Imported directly in embeddings.py — pinned explicitly rather than relying
 # on it arriving transitively via sentence-transformers.
 numpy>=1.26.0
+pytest>=8.0.0

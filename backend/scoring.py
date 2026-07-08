@@ -942,6 +942,18 @@ def _detect_difficulty_bias(text: str) -> str | None:
     return None
 
 
+# Matches shorthand code lists students actually type, e.g. "MAT235/236" or
+# "MAT235/236/237", where only the first code carries the subject letters and
+# later "/nnn" segments implicitly reuse them. _COURSE_CODE_RE alone misses the
+# bare "236" (no letters attached once the "/" breaks the token), so this
+# captures the full first code plus any trailing bare-digit continuations to
+# expand below. Kept separate from _COURSE_CODE_RE since that regex is shared
+# with prerequisite-text parsing, where the calendar always spells codes out in full.
+_COURSE_CODE_SHORTHAND_RE = re.compile(
+    r'\b([A-Z]{2,4}\d{3}[HY]?\d?)((?:\s*/\s*\d{3}[HY]?\d?)+)?\b', re.IGNORECASE
+)
+
+
 def _find_courses_by_code(message: str, course_list: list["Course"]) -> list[tuple["Course", float]]:
     """
     Direct course-code lookup before any interest scoring runs.
@@ -953,8 +965,19 @@ def _find_courses_by_code(message: str, course_list: list["Course"]) -> list[tup
     """
     found: list[tuple["Course", float]] = []
     seen_codes: set[str] = set()
-    for m in _COURSE_CODE_RE.finditer(message):
-        query = m.group(1).upper()
+
+    queries: list[str] = []
+    for m in _COURSE_CODE_SHORTHAND_RE.finditer(message):
+        full_code, shorthand = m.group(1).upper(), m.group(2)
+        queries.append(full_code)
+        if shorthand:
+            prefix = re.match(r'[A-Z]{2,4}', full_code).group()
+            for bare in shorthand.split('/'):
+                bare = bare.strip().upper()
+                if bare:
+                    queries.append(prefix + bare)
+
+    for query in queries:
         for course in course_list:
             code = course.get_course_code().upper()
             # startswith so "MAT148" matches "MAT148H1", "MAT148H5", etc.
