@@ -15,6 +15,11 @@ import json
 from pathlib import Path
 
 import numpy as np
+from dotenv import load_dotenv
+
+# Needed standalone (unlike when imported via main.py, which already calls this) —
+# encode() now calls the Voyage API and needs VOYAGE_API_KEY from .env.
+load_dotenv()
 
 from program_data import load_programs
 from embeddings import encode

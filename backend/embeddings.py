@@ -4,23 +4,48 @@ import json
 from pathlib import Path
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
+import voyageai
 
-# ── Model singleton ──────────────────────────────────────────────────────────
-# ~90 MB, takes a few seconds to load. Loaded once on first encode/search call.
-_model: SentenceTransformer | None = None
+# ── Client singleton ─────────────────────────────────────────────────────────
+# Voyage API calls replace the local sentence-transformers model — that model
+# kept ~90MB of weights plus torch's much larger runtime overhead resident in
+# memory for the process lifetime, which was the dominant driver of Railway's
+# RAM-based billing. voyageai.Client() picks up VOYAGE_API_KEY from the
+# environment when no key is passed explicitly.
+_client: voyageai.Client | None = None
+
+_MODEL = "voyage-3-lite"
+
+# Voyage hard-caps a single embed() request at 1000 texts — confirmed against
+# the real API when re-embedding the ~3200-course catalog in one call.
+_MAX_BATCH_SIZE = 1000
 
 
-def get_model() -> SentenceTransformer:
-    global _model
-    if _model is None:
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _model
+def get_client() -> voyageai.Client:
+    global _client
+    if _client is None:
+        _client = voyageai.Client()
+    return _client
 
 
-def encode(texts: list[str], show_progress: bool = False) -> np.ndarray:
-    """Embed a list of strings. Returns shape (len(texts), 384)."""
-    return get_model().encode(texts, show_progress_bar=show_progress, convert_to_numpy=True)
+def encode(texts: list[str], input_type: str | None = None) -> np.ndarray:
+    """
+    Embed a list of strings via the Voyage API. Returns shape (len(texts), dim).
+
+    input_type ("query" or "document") tells Voyage which side of a retrieval
+    pair this text is — its models are trained asymmetrically, so tagging each
+    side improves ranking quality over embedding both sides identically.
+
+    Splits into <=1000-text requests since that's Voyage's hard per-request
+    limit; single queries (the common runtime case) never hit this path.
+    """
+    client = get_client()
+    all_embeddings: list[list[float]] = []
+    for i in range(0, len(texts), _MAX_BATCH_SIZE):
+        batch = texts[i:i + _MAX_BATCH_SIZE]
+        result = client.embed(batch, model=_MODEL, input_type=input_type)
+        all_embeddings.extend(result.embeddings)
+    return np.array(all_embeddings)
 
 
 # ── Embedding index singleton ────────────────────────────────────────────────
@@ -64,7 +89,7 @@ def semantic_search(
     longer descriptions instead of ones that actually match.
     """
     vectors, codes = _load_index()
-    query_vec = get_model().encode([query], convert_to_numpy=True)[0]  # (384,)
+    query_vec = encode([query], input_type="query")[0]
 
     norms = np.linalg.norm(vectors, axis=1) * np.linalg.norm(query_vec)
     # Guard against zero-magnitude vectors (shouldn't happen, but safe)
@@ -77,7 +102,12 @@ def semantic_search(
         mask = np.array([c in allowed_codes for c in codes], dtype=bool)
         sims = np.where(mask, sims, -np.inf)
 
-    top_indices = np.argsort(sims)[::-1][:top_n]
+    # Drop masked-out (-inf) entries entirely rather than just sorting them
+    # last — otherwise a narrow allowed_codes filter (fewer real candidates
+    # than top_n) would backfill the result with excluded courses instead of
+    # returning a short, fully-valid list.
+    order = np.argsort(sims)[::-1]
+    top_indices = [i for i in order if sims[i] != -np.inf][:top_n]
     return [(codes[i], float(sims[i])) for i in top_indices]
 
 
@@ -116,7 +146,7 @@ def program_semantic_search(
     touching it and risking existing callers. Could be unified later.
     """
     vectors, codes = _load_program_index()
-    query_vec = get_model().encode([query], convert_to_numpy=True)[0]
+    query_vec = encode([query], input_type="query")[0]
 
     norms = np.linalg.norm(vectors, axis=1) * np.linalg.norm(query_vec)
     sims = (vectors @ query_vec) / np.where(norms == 0, 1e-9, norms)
@@ -125,5 +155,6 @@ def program_semantic_search(
         mask = np.array([c in allowed_codes for c in codes], dtype=bool)
         sims = np.where(mask, sims, -np.inf)
 
-    top_indices = np.argsort(sims)[::-1][:top_n]
+    order = np.argsort(sims)[::-1]
+    top_indices = [i for i in order if sims[i] != -np.inf][:top_n]
     return [(codes[i], float(sims[i])) for i in top_indices]

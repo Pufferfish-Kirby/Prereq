@@ -4,6 +4,7 @@ import logging
 import os
 from dotenv import load_dotenv
 import anthropic
+import voyageai
 from fastapi import FastAPI, Header, HTTPException, Request
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -61,23 +62,21 @@ try:
 except FileNotFoundError:
     program_catalog = []
 
-# Eagerly warm the embedding pipeline (sentence-transformers model + both
-# .npy indices) at startup instead of leaving it lazy.
-# WHY: get_model()/the index loaders in embeddings.py are lazy singletons —
-# normally a fine pattern, but on Railway the process restarts on every
-# deploy, so whoever sends the FIRST chat message after a deploy pays the
-# full load cost. Measured locally at 10-40+ seconds (dominated by importing
-# torch/sentence-transformers, not the 90MB of weights themselves) stacked on
-# top of the real Claude API latency — indistinguishable from the AI itself
-# being broken. Running a throwaway search here means that cost lands during
-# container startup, before Railway's health check passes and routes real
-# traffic, instead of on some unlucky user's first message.
+# Warm the embedding indices (both .npy files) at startup instead of leaving
+# them lazy, so a broken Voyage API key or missing index file surfaces at
+# deploy time — before Railway's health check passes and routes real traffic —
+# instead of on some unlucky user's first chat message.
+# WHY catch VoyageError here too (not just FileNotFoundError): a Voyage outage
+# or misconfigured VOYAGE_API_KEY would otherwise raise past this and crash
+# the whole app at import time. /chat already degrades gracefully when course/
+# program context can't be built (see _build_course_context/_build_program_context),
+# so a warmup failure should behave the same way: start without it, not crash.
 try:
     from embeddings import semantic_search, program_semantic_search
     semantic_search("warmup", top_n=1)
     program_semantic_search("warmup", top_n=1)
-except FileNotFoundError:
-    pass  # embeddings not built yet — /chat already degrades gracefully in this case
+except (FileNotFoundError, voyageai.error.VoyageError):
+    pass  # embeddings not built yet, or Voyage unreachable — degrade gracefully
 
 # CORSMiddleware lets the browser make requests from the frontend's origin to
 # this API. Without it, browsers block all cross-origin requests before they
@@ -255,7 +254,13 @@ def _build_course_context(message: str, extra_codes: set[str] | None = None) -> 
     Returns an empty string when nothing's relevant, so the system prompt
     stays clean for messages that aren't about courses.
     """
-    relevant = search_by_message(message, course_catalog, top_n=_COURSE_CONTEXT_TOP_N)
+    # Degrade to no course context on a Voyage failure (outage, rate limit,
+    # bad key) rather than letting it crash the request — same rule as a
+    # missing embedding index (see _build_program_context below).
+    try:
+        relevant = search_by_message(message, course_catalog, top_n=_COURSE_CONTEXT_TOP_N)
+    except voyageai.error.VoyageError:
+        return ""
     seen_codes = {course.get_course_code() for course, _ in relevant}
 
     # Exact lookup for any extra codes not already covered by semantic search.
@@ -318,15 +323,16 @@ def _build_program_context(message: str) -> tuple[str, list[Program]]:
     has no other callers, so widening the return type here is safe.
 
     Returns ("", []) when no programs are relevant, the catalog is empty,
-    or the program embedding index hasn't been built yet (FileNotFoundError),
-    so the server degrades gracefully in all cases.
+    the program embedding index hasn't been built yet (FileNotFoundError), or
+    Voyage itself fails (VoyageError) — so the server degrades gracefully in
+    all cases instead of a broken embedding call crashing the whole request.
     """
     if not program_catalog:
         return "", []
     try:
         relevant = search_programs_by_message(message, program_catalog, top_n=2)
-    except FileNotFoundError:
-        # program_embeddings.npy not built yet — degrade silently
+    except (FileNotFoundError, voyageai.error.VoyageError):
+        # program_embeddings.npy not built yet, or Voyage unreachable — degrade silently
         return "", []
     if not relevant:
         return "", []
