@@ -6,7 +6,7 @@ Course selection at the University of Toronto can be a long process where you ha
 
 ## What it does
 
-MyUofT is a app that knows the entire University of Toronto Faculty of Arts & Science course catalog and answers questions about it conversationally. Instead of digging through the Academic Calendar and trying to put the piece together yourself, you describe what you want and it finds courses that actually fit your needs and shows you why it is best.
+MyUofT is a app that knows the entire University of Toronto Faculty of Arts & Science course catalog and answers questions about it conversationally. Instead of digging through the Academic Calendar and trying to put the pieces together yourself, you describe what you want and it finds courses that actually fit your needs and shows you why it is best.
 
 ## How it works
 
