@@ -25,7 +25,7 @@ A separate embedding index does the same thing for program/degree requirement da
 
 | Layer | Technology |
 |---|---|
-| Frontend | React, TypeScript, Vite, Tailwind CSS |
+| Frontend | React, Vite, Tailwind CSS |
 | Backend | FastAPI, Python |
 | AI (chat) | Claude Haiku 4.5 |
 | AI (course enrichment) | Claude Haiku 4.5 via the Anthropic Batches API |
