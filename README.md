@@ -2,7 +2,7 @@
 
 Course selection at the University of Toronto can be a long process where you have to go to multiple pages to get the information you need. Prereq gives you one space to get everything you need, using AI-powered course advising. Ask it what you're interested in, get back real courses from the actual calendar, not a keyword match.
 
-**Live: [my-uoft.vercel.app](https://my-uoft.vercel.app)**
+**Live: [prereq-jr.vercel.app](https://prereq-jr.vercel.app)**
 
 ## What it does
 
