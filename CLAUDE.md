@@ -1,10 +1,10 @@
-# MyUofT — AI-Powered Course Planning for University of Toronto Students
+# Prereq — AI-Powered Course Planning for University of Toronto Students
 
 ## Project Overview
 
-MyUofT is an AI-powered course planning tool that helps University of Toronto students navigate the overwhelming number of courses, minors, majors, and specialist programs available across all three campuses (St. George, UTM, UTSC). The tool understands student preferences, academic goals, and degree requirements, then generates personalized long-term academic plans.
+Prereq is an AI-powered course planning tool that helps University of Toronto students navigate the overwhelming number of courses, minors, majors, and specialist programs available across all three campuses (St. George, UTM, UTSC). The tool understands student preferences, academic goals, and degree requirements, then generates personalized long-term academic plans.
 
-**Core value proposition:** Students shouldn't need to spend weeks parsing the Academic Calendar to figure out what to take. MyUofT turns a 20-minute conversation into a 4-year plan.
+**Core value proposition:** Students shouldn't need to spend weeks parsing the Academic Calendar to figure out what to take. Prereq turns a 20-minute conversation into a 4-year plan.
 
 ---
 

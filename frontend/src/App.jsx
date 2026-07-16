@@ -15,10 +15,10 @@ const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 // sent as the X-Device-Id header so the backend can keep chat history private
 // per visitor. Used instead of real accounts because Phase 1 has no login yet.
 function getDeviceId() {
-  let id = localStorage.getItem('myuoft_device_id')
+  let id = localStorage.getItem('prereq_device_id')
   if (!id) {
     id = crypto.randomUUID()
-    localStorage.setItem('myuoft_device_id', id)
+    localStorage.setItem('prereq_device_id', id)
   }
   return id
 }
@@ -448,7 +448,7 @@ function App() {
           Slightly translucent + blurred so content scrolling beneath it gives a
           subtle sense of depth, and a hairline border to separate it cleanly. */}
       <header className="sticky top-0 z-20 bg-uoft-blue/95 backdrop-blur border-b border-white/10 px-6 sm:px-8 py-3.5 flex items-center gap-3">
-        {/* Logo is a real button: clicking "MyUofT" returns to the landing page,
+        {/* Logo is a real button: clicking "Prereq" returns to the landing page,
             the conventional behaviour users expect from a product wordmark. */}
         <button
           onClick={() => setActiveTab('home')}
@@ -459,7 +459,7 @@ function App() {
               brand accent without shouting. */}
           <span className="w-1 h-7 rounded-full bg-white group-hover:bg-uoft-accent transition-colors" />
           <span className="text-white text-xl font-semibold tracking-wide">
-            My<span className="text-uoft-accent">UofT</span>
+            Pre<span className="text-uoft-accent">req</span>
           </span>
         </button>
 
@@ -543,7 +543,7 @@ function App() {
                 >
                   UofT students face thousands of courses, minors, majors and specialist
                   programs across the Faculty of Arts and Science. Parsing
-                  the Academic Calendar to figure out what to take can take weeks. MyUofT
+                  the Academic Calendar to figure out what to take can take weeks. Prereq
                   understands your interests, goals and degree requirements, then builds a
                   personalized long-term plan in minutes.
                 </p>
